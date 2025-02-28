@@ -664,7 +664,6 @@ mod tests {
         let mut watcher = recommended_watcher(|e| {
             println!("{:?}", e);
         })?;
-        watcher.watch(dir.path(), RecursiveMode::NonRecursive)?;
         watcher.watch(&child_dir, RecursiveMode::NonRecursive)?;
 
         trash::delete(&child_dir)?;
