@@ -151,7 +151,7 @@ impl ReadDirectoryChangesServer {
 
             unsafe {
                 // wait with alertable flag so that the completion routine fires
-                let waitres = WaitForSingleObject(self.wakeup_sem, 100);
+                let waitres = WaitForSingleObjectEx(self.wakeup_sem, 100, 1);
                 if waitres == WAIT_OBJECT_0 {
                     let _ = self.meta_tx.send(MetaEvent::WatcherAwakened);
                 }
@@ -362,6 +362,19 @@ unsafe extern "system" fn handle_event(
                 error_code
             );
             request.unwatch();
+            ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+            return;
+        }
+    }
+
+    if error_code == ERROR_ACCESS_DENIED {
+        // This could hanppen when the watched directory is deleted or trahsed, first check if it's the case.
+        // If so, unwatch the directory and return.
+        if !request.data.dir.exists() {
+            request
+                .action_tx
+                .send(Action::Unwatch(request.data.dir.clone()))
+                .ok();
             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
             return;
         }
