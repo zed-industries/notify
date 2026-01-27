@@ -298,7 +298,9 @@ impl FsEventWatcher {
             },
             since_when: fs::kFSEventStreamEventIdSinceNow,
             latency: 0.0,
-            flags: fs::kFSEventStreamCreateFlagFileEvents | fs::kFSEventStreamCreateFlagNoDefer,
+            flags: fs::kFSEventStreamCreateFlagFileEvents
+                | fs::kFSEventStreamCreateFlagNoDefer
+                | fs::kFSEventStreamCreateFlagWatchRoot,
             event_handler,
             runloop: None,
             recursive_info: HashMap::new(),
