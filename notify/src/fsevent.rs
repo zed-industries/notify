@@ -265,6 +265,7 @@ extern "C" fn release_context(info: *const libc::c_void) {
 extern "C" {
     /// Indicates whether the run loop is waiting for an event.
     fn CFRunLoopIsWaiting(runloop: cf::CFRunLoopRef) -> cf::Boolean;
+    fn CFRetain(cf: cf::CFRef) -> cf::CFRef;
 }
 
 struct FsEventPathsMut<'a>(&'a mut FsEventWatcher);
@@ -346,6 +347,11 @@ impl FsEventWatcher {
 
             // Wait for the thread to shut down.
             thread_handle.join().expect("thread to shut down");
+
+            // Release the retained reference from run().
+            unsafe {
+                cf::CFRelease(runloop);
+            }
         }
     }
 
@@ -475,10 +481,16 @@ impl FsEventWatcher {
                     );
                     fs::FSEventStreamStart(stream);
 
+                    // Retain the runloop so the reference we send to the
+                    // caller survives even if this thread exits before
+                    // stop() uses it. The caller releases in stop().
+                    CFRetain(cur_runloop);
+
                     // the calling to CFRunLoopRun will be terminated by CFRunLoopStop call in drop()
-                    rl_tx
-                        .send(CFSendWrapper(cur_runloop))
-                        .expect("Unable to send runloop to watcher");
+                    let Ok(_) = rl_tx.send(CFSendWrapper(cur_runloop)) else {
+                        cf::CFRelease(cur_runloop);
+                        panic!("Unable to send runloop to watcher");
+                    };
 
                     cf::CFRunLoopRun();
                     fs::FSEventStreamStop(stream);
