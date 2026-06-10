@@ -27,7 +27,6 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -83,7 +82,7 @@ struct WatchInfo {
 #[derive(Debug)]
 struct RunLoopHandle {
     runloop: cf::CFRetained<cf::CFRunLoop>,
-    stop_flag: Arc<AtomicBool>,
+    stop_source: cf::CFRetained<cf::CFRunLoopSource>,
     thread_handle: thread::JoinHandle<()>,
 }
 
@@ -335,6 +334,14 @@ unsafe extern "C-unwind" fn release_context(info: *const libc::c_void) {
     }
 }
 
+// Runs on the watcher thread, inside the running runloop, where
+// `CFRunLoopStop` is guaranteed to take effect.
+unsafe extern "C-unwind" fn stop_runloop_perform(_info: *mut std::ffi::c_void) {
+    if let Some(runloop) = cf::CFRunLoop::current() {
+        runloop.stop();
+    }
+}
+
 impl FsEventWatcher {
     fn from_event_handler(
         event_handler: Arc<Mutex<dyn EventHandler>>,
@@ -414,14 +421,19 @@ impl FsEventWatcher {
 
         if let Some(RunLoopHandle {
             runloop,
-            stop_flag,
+            stop_source,
             thread_handle,
         }) = self.runloop.take()
         {
-            // Don't wait for the runloop to become "waiting" before stopping; if the
-            // stream is under heavy load that can delay shutdown indefinitely.
-            stop_flag.store(true, Ordering::Release);
-            runloop.stop();
+            // Calling `CFRunLoopStop` directly here would race: it only takes effect
+            // while the runloop is actually running, so a stop landing in the window
+            // before the watcher thread enters `CFRunLoopRun` would be lost and the
+            // `join` below would deadlock. Signaling a runloop source instead is
+            // sticky: the signal stays pending until the loop runs, and the source's
+            // `perform` callback then stops the loop from the inside, where the stop
+            // cannot be lost. The wake-up covers the case where the loop is already
+            // asleep.
+            stop_source.signal();
             runloop.wake_up();
             // Wait for the thread to shut down.
             thread_handle.join().expect("thread to shut down");
@@ -542,10 +554,14 @@ impl FsEventWatcher {
         };
 
         // Wrapper to help send CFRunLoop types across threads.
-        struct CFRunLoopSendWrapper(cf::CFRetained<cf::CFRunLoop>);
+        struct CFRunLoopSendWrapper(
+            cf::CFRetained<cf::CFRunLoop>,
+            cf::CFRetained<cf::CFRunLoopSource>,
+        );
 
         // Safety:
-        // - According to the Apple documentation, it's safe to move `CFRunLoop`s across threads.
+        // - According to the Apple documentation, it's safe to move `CFRunLoop`s and
+        //   `CFRunLoopSource`s across threads.
         //   https://developer.apple.com/library/archive/documentation/Cocoa/Conceptual/Multithreading/ThreadSafetySummary/ThreadSafetySummary.html
         unsafe impl Send for CFRunLoopSendWrapper {}
 
@@ -561,11 +577,6 @@ impl FsEventWatcher {
 
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
-
-        // Used to stop the runloop thread without relying on privileged APIs or
-        // on `CFRunLoopIsWaiting()` becoming true under heavy event load.
-        let stop_flag = Arc::new(AtomicBool::new(false));
-        let stop_flag_thread = Arc::clone(&stop_flag);
 
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
@@ -595,17 +606,41 @@ impl FsEventWatcher {
                         return;
                     }
 
-                    // `stop()` will call `CFRunLoopStop` + `CFRunLoopWakeUp` and then join this
-                    // thread.
+                    // The source through which stop() asks this thread to shut down. It
+                    // must be created and added to the runloop before the handles are
+                    // published below, so the caller can never signal a source that is
+                    // not registered yet.
+                    let mut stop_source_context = cf::CFRunLoopSourceContext {
+                        version: 0,
+                        info: ptr::null_mut(),
+                        retain: None,
+                        release: None,
+                        copyDescription: None,
+                        equal: None,
+                        hash: None,
+                        schedule: None,
+                        cancel: None,
+                        perform: Some(stop_runloop_perform),
+                    };
+                    let stop_source = cf::CFRunLoopSource::new(
+                        cf::kCFAllocatorDefault,
+                        0,
+                        &mut stop_source_context,
+                    )
+                    .expect("Failed to create stop source");
+                    cur_runloop.add_source(Some(&stop_source), cf::kCFRunLoopDefaultMode);
+
+                    // `stop()` will signal `stop_source`, wake the runloop, and then join
+                    // this thread.
                     rl_tx
-                        .send(Ok(CFRunLoopSendWrapper(cur_runloop)))
+                        .send(Ok(CFRunLoopSendWrapper(cur_runloop, stop_source.clone())))
                         .expect("Unable to send runloop to watcher");
 
-                    // Avoid polling the runloop: block indefinitely until `CFRunLoopStop` is
-                    // called (or until the runloop is otherwise finished).
-                    if !stop_flag_thread.load(Ordering::Acquire) {
-                        cf::CFRunLoop::run();
-                    }
+                    // Block until the pending signal on `stop_source` (if any) or a later
+                    // one stops the loop from the inside; see `stop()`.
+                    cf::CFRunLoop::run();
+
+                    stop_source.invalidate();
                     fs::FSEventStreamStop(stream);
                     fs::FSEventStreamInvalidate(stream);
                     fs::FSEventStreamRelease(stream);
@@ -631,7 +666,7 @@ impl FsEventWatcher {
         };
         self.runloop = Some(RunLoopHandle {
             runloop: runloop_wrapper.0,
-            stop_flag,
+            stop_source: runloop_wrapper.1,
             thread_handle,
         });
 
@@ -992,6 +1027,108 @@ mod tests {
 
         // No cleanup: The source is owned by the runloop; removing sources cross-thread can be
         // sensitive on some systems. Dropping the last reference to the runloop will release it.
+    }
+
+    // Regression test for a lost `CFRunLoopStop`: stopping is a no-op while the
+    // runloop thread is between publishing its handles and actually entering
+    // `CFRunLoopRun`, so a single stop could leave the thread parked forever and
+    // deadlock the join in `stop()`. Rapid watch/unwatch cycles maximize pressure
+    // on that window.
+    #[test]
+    fn rapid_watch_unwatch_does_not_hang() {
+        use std::sync::mpsc;
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let dir_a = tmpdir.path().join("a");
+        let dir_b = tmpdir.path().join("b");
+        std::fs::create_dir(&dir_a).expect("create_dir a");
+        std::fs::create_dir(&dir_b).expect("create_dir b");
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let stress_thread = thread::spawn(move || {
+            let (tx, _rx) = mpsc::channel::<crate::Result<Event>>();
+            let mut watcher = FsEventWatcher::new(tx, Default::default()).unwrap();
+            for _ in 0..500 {
+                // Errors are tolerated: under load (e.g. the 4096-path test running
+                // concurrently) fseventsd transiently refuses stream starts even for
+                // tiny path sets. The property under test is purely that none of
+                // these operations hangs.
+                let _ = watcher.watch(&dir_a, RecursiveMode::NonRecursive);
+                let _ = watcher.watch(&dir_b, RecursiveMode::NonRecursive);
+                let _ = watcher.unwatch(&dir_a);
+                let _ = watcher.unwatch(&dir_b);
+            }
+            let _ = done_tx.send(());
+        });
+
+        done_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("rapid watch/unwatch timed out (lost CFRunLoopStop?)");
+        stress_thread.join().expect("stress thread to shut down");
+    }
+
+    // Deterministic test of the race window above: a stop source signaled
+    // before `CFRunLoopRun` is entered must still stop the loop, because
+    // source signals stay pending until the loop processes them.
+    #[test]
+    fn stop_source_signaled_before_runloop_run_still_stops_loop() {
+        use std::sync::mpsc;
+
+        struct CFSendWrapper<T: cf::Type>(cf::CFRetained<T>);
+        unsafe impl<T: cf::Type> Send for CFSendWrapper<T> {}
+
+        let (handles_tx, handles_rx) = mpsc::channel();
+        let (signaled_tx, signaled_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+
+        let loop_thread = thread::spawn(move || {
+            let cur_runloop = cf::CFRunLoop::current().expect("current runloop");
+
+            let mut stop_source_context = cf::CFRunLoopSourceContext {
+                version: 0,
+                info: ptr::null_mut(),
+                retain: None,
+                release: None,
+                copyDescription: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: Some(stop_runloop_perform),
+            };
+            let stop_source = unsafe {
+                cf::CFRunLoopSource::new(cf::kCFAllocatorDefault, 0, &mut stop_source_context)
+                    .expect("stop source to be created")
+            };
+            let mode = unsafe { cf::kCFRunLoopDefaultMode.expect("default runloop mode") };
+            cur_runloop.add_source(Some(&stop_source), Some(mode));
+
+            handles_tx
+                .send((
+                    CFSendWrapper(cur_runloop),
+                    CFSendWrapper(stop_source.clone()),
+                ))
+                .expect("send runloop handles");
+
+            signaled_rx
+                .recv()
+                .expect("wait for the stop source to be signaled");
+
+            cf::CFRunLoop::run();
+
+            stop_source.invalidate();
+            let _ = done_tx.send(());
+        });
+
+        let (runloop, stop_source) = handles_rx.recv().expect("receive runloop handles");
+        stop_source.0.signal();
+        runloop.0.wake_up();
+        signaled_tx.send(()).expect("release the loop thread");
+
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("CFRunLoopRun did not exit; pre-run stop source signal was lost");
+        loop_thread.join().expect("loop thread to shut down");
     }
 
     #[test]
