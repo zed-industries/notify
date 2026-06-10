@@ -285,9 +285,7 @@ impl PathsMut for FsEventPathsMut<'_> {
     }
 
     fn commit(self: Box<Self>) -> Result<()> {
-        // ignore return error: may be empty path list
-        let _ = self.0.run();
-        Ok(())
+        self.0.run()
     }
 }
 
@@ -311,16 +309,14 @@ impl FsEventWatcher {
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
         self.stop();
         let result = self.append_path(path, recursive_mode);
-        // ignore return error: may be empty path list
-        let _ = self.run();
+        self.run()?;
         result
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
         self.stop();
         let result = self.remove_path(path);
-        // ignore return error: may be empty path list
-        let _ = self.run();
+        self.run()?;
         result
     }
 
@@ -421,8 +417,9 @@ impl FsEventWatcher {
 
     fn run(&mut self) -> Result<()> {
         if unsafe { cf::CFArrayGetCount(self.paths) } == 0 {
-            // TODO: Reconstruct and add paths to error
-            return Err(Error::path_not_found());
+            // The watcher is allowed to have no paths (e.g. after unwatching
+            // the last one); staying stopped is the correct state.
+            return Ok(());
         }
 
         // We need to associate the stream context with our callback in order to propagate events
@@ -733,16 +730,22 @@ fn watcher_does_not_hang_after_stream_start_failure() {
                     .add(path, RecursiveMode::NonRecursive)
                     .expect("add path");
             }
-            // The stream fails to start here; the error is swallowed by
-            // `commit`, but the watcher must be left in a stopped state
-            // rather than holding a handle to a dead runloop.
-            paths_mut.commit().expect("commit");
+            // The stream fails to start here; the error must be surfaced
+            // and the watcher left in a stopped state rather than holding a
+            // handle to a dead runloop.
+            let commit_error = paths_mut.commit().expect_err("commit should surface start failure");
+            assert!(
+                commit_error.to_string().contains("unable to start FSEvent stream"),
+                "unexpected commit error: {commit_error}"
+            );
         }
 
         // Both of these used to hang forever in `stop()`.
         let extra = tmpdir.path().join("extra");
         std::fs::create_dir(&extra).expect("create_dir");
-        let _ = watcher.watch(&extra, RecursiveMode::NonRecursive);
+        watcher
+            .watch(&extra, RecursiveMode::NonRecursive)
+            .expect_err("watch should surface start failure while over the limit");
         drop(watcher);
 
         // Bypass `TempDir`'s Drop: `remove_dir_all` can be flaky with this
