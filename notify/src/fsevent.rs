@@ -26,6 +26,7 @@ use std::fmt;
 use std::os::raw;
 use std::path::{Path, PathBuf};
 use std::ptr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -67,7 +68,7 @@ pub struct FsEventWatcher {
     latency: cf::CFTimeInterval,
     flags: fs::FSEventStreamCreateFlags,
     event_handler: Arc<Mutex<dyn EventHandler>>,
-    runloop: Option<(cf::CFRunLoopRef, thread::JoinHandle<()>)>,
+    runloop: Option<(cf::CFRunLoopRef, Arc<AtomicBool>, thread::JoinHandle<()>)>,
     recursive_info: HashMap<PathBuf, bool>,
 }
 
@@ -263,8 +264,7 @@ extern "C" fn release_context(info: *const libc::c_void) {
 }
 
 extern "C" {
-    /// Indicates whether the run loop is waiting for an event.
-    fn CFRunLoopIsWaiting(runloop: cf::CFRunLoopRef) -> cf::Boolean;
+    fn CFRunLoopWakeUp(runloop: cf::CFRunLoopRef);
     fn CFRetain(cf: cf::CFRef) -> cf::CFRef;
 }
 
@@ -285,9 +285,7 @@ impl PathsMut for FsEventPathsMut<'_> {
     }
 
     fn commit(self: Box<Self>) -> Result<()> {
-        // ignore return error: may be empty path list
-        let _ = self.0.run();
-        Ok(())
+        self.0.run()
     }
 }
 
@@ -311,16 +309,14 @@ impl FsEventWatcher {
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
         self.stop();
         let result = self.append_path(path, recursive_mode);
-        // ignore return error: may be empty path list
-        let _ = self.run();
+        self.run()?;
         result
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
         self.stop();
         let result = self.remove_path(path);
-        // ignore return error: may be empty path list
-        let _ = self.run();
+        self.run()?;
         result
     }
 
@@ -334,15 +330,18 @@ impl FsEventWatcher {
             return;
         }
 
-        if let Some((runloop, thread_handle)) = self.runloop.take() {
+        if let Some((runloop, stop_flag, thread_handle)) = self.runloop.take() {
             unsafe {
                 let runloop = runloop as *mut raw::c_void;
 
-                while CFRunLoopIsWaiting(runloop) == 0 {
-                    thread::yield_now();
-                }
-
+                // Don't wait for the runloop to enter the "waiting" state before
+                // stopping it: under heavy event load it may never get there, and
+                // if the runloop thread already exited (e.g. the stream failed to
+                // start) it never will, so waiting would spin forever. The flag
+                // makes the thread skip `CFRunLoopRun` if it hasn't entered it yet.
+                stop_flag.store(true, Ordering::Release);
                 cf::CFRunLoopStop(runloop);
+                CFRunLoopWakeUp(runloop);
             }
 
             // Wait for the thread to shut down.
@@ -418,8 +417,9 @@ impl FsEventWatcher {
 
     fn run(&mut self) -> Result<()> {
         if unsafe { cf::CFArrayGetCount(self.paths) } == 0 {
-            // TODO: Reconstruct and add paths to error
-            return Err(Error::path_not_found());
+            // The watcher is allowed to have no paths (e.g. after unwatching
+            // the last one); staying stopped is the correct state.
+            return Ok(());
         }
 
         // We need to associate the stream context with our callback in order to propagate events
@@ -465,6 +465,11 @@ impl FsEventWatcher {
         // channel to pass runloop around
         let (rl_tx, rl_rx) = unbounded();
 
+        // Used to stop the runloop thread without relying on
+        // `CFRunLoopIsWaiting()` becoming true under heavy event load.
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let stop_flag_thread = Arc::clone(&stop_flag);
+
         let thread_handle = thread::Builder::new()
             .name("notify-rs fsevents loop".to_string())
             .spawn(move || {
@@ -479,20 +484,31 @@ impl FsEventWatcher {
                         cur_runloop,
                         cf::kCFRunLoopDefaultMode,
                     );
-                    fs::FSEventStreamStart(stream);
+                    if fs::FSEventStreamStart(stream) == 0 {
+                        // Propagate the failure instead of carrying on: if this
+                        // thread exited while the caller held a runloop handle,
+                        // the next `stop()` would wait forever on a dead runloop.
+                        fs::FSEventStreamInvalidate(stream);
+                        fs::FSEventStreamRelease(stream);
+                        let _ = rl_tx.send(Err(Error::generic("unable to start FSEvent stream")));
+                        return;
+                    }
 
                     // Retain the runloop so the reference we send to the
                     // caller survives even if this thread exits before
                     // stop() uses it. The caller releases in stop().
                     CFRetain(cur_runloop);
 
-                    // the calling to CFRunLoopRun will be terminated by CFRunLoopStop call in drop()
-                    let Ok(_) = rl_tx.send(CFSendWrapper(cur_runloop)) else {
+                    // `stop()` will call `CFRunLoopStop` + `CFRunLoopWakeUp` and
+                    // then join this thread.
+                    let Ok(_) = rl_tx.send(Ok(CFSendWrapper(cur_runloop))) else {
                         cf::CFRelease(cur_runloop);
                         panic!("Unable to send runloop to watcher");
                     };
 
-                    cf::CFRunLoopRun();
+                    if !stop_flag_thread.load(Ordering::Acquire) {
+                        cf::CFRunLoopRun();
+                    }
                     fs::FSEventStreamStop(stream);
                     // There are edge-cases, when many events are pending,
                     // despite the stream being stopped, that the stream's
@@ -506,7 +522,25 @@ impl FsEventWatcher {
                 }
             })?;
         // block until runloop has been sent
-        self.runloop = Some((rl_rx.recv().unwrap().0, thread_handle));
+        match rl_rx.recv() {
+            Ok(Ok(runloop)) => {
+                self.runloop = Some((runloop.0, stop_flag, thread_handle));
+            }
+            Ok(Err(err)) => {
+                thread_handle
+                    .join()
+                    .expect("thread to shut down after FSEvent stream start failure");
+                return Err(err);
+            }
+            Err(_) => {
+                thread_handle
+                    .join()
+                    .expect("thread to shut down after FSEvent stream startup channel close");
+                return Err(Error::generic(
+                    "unable to receive FSEvent stream startup result",
+                ));
+            }
+        }
 
         Ok(())
     }
@@ -662,4 +696,69 @@ fn test_fsevent_watcher_drop() {
 fn test_steam_context_info_send_and_sync() {
     fn check_send<T: Send + Sync>() {}
     check_send::<StreamContextInfo>();
+}
+
+
+// fsevents does not allow watching more than 4096 paths in one stream, so
+// FSEventStreamStart fails. Regression test for two related shutdown hangs:
+// before propagating the start failure, the runloop thread exited silently
+// while `self.runloop` was still `Some`, and the next watch/unwatch call spun
+// forever in `stop()` waiting for `CFRunLoopIsWaiting()` on a dead runloop.
+// https://github.com/fsnotify/fsevents/issues/48
+#[test]
+fn watcher_does_not_hang_after_stream_start_failure() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let tmpdir = tempfile::tempdir().unwrap();
+    let mut paths = Vec::new();
+    for i in 0..=4096 {
+        let path = tmpdir.path().join(format!("dir_{i}"));
+        std::fs::create_dir(&path).expect("create_dir");
+        paths.push(path);
+    }
+
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let watch_thread = thread::spawn(move || {
+        let (tx, _rx) = mpsc::channel();
+        let mut watcher = FsEventWatcher::new(tx, Default::default()).unwrap();
+
+        {
+            let mut paths_mut = watcher.paths_mut();
+            for path in &paths {
+                paths_mut
+                    .add(path, RecursiveMode::NonRecursive)
+                    .expect("add path");
+            }
+            // The stream fails to start here; the error must be surfaced
+            // and the watcher left in a stopped state rather than holding a
+            // handle to a dead runloop.
+            let commit_error = paths_mut.commit().expect_err("commit should surface start failure");
+            assert!(
+                commit_error.to_string().contains("unable to start FSEvent stream"),
+                "unexpected commit error: {commit_error}"
+            );
+        }
+
+        // Both of these used to hang forever in `stop()`.
+        let extra = tmpdir.path().join("extra");
+        std::fs::create_dir(&extra).expect("create_dir");
+        watcher
+            .watch(&extra, RecursiveMode::NonRecursive)
+            .expect_err("watch should surface start failure while over the limit");
+        drop(watcher);
+
+        // Bypass `TempDir`'s Drop: `remove_dir_all` can be flaky with this
+        // many directories while fsevents may still hold references.
+        let tmpdir_path = tmpdir.path().to_path_buf();
+        std::mem::forget(tmpdir);
+        let _ = std::fs::remove_dir_all(&tmpdir_path);
+
+        let _ = done_tx.send(());
+    });
+
+    done_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("watcher operations timed out (possible shutdown hang)");
+    watch_thread.join().expect("watch thread to shut down");
 }
