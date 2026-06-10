@@ -542,11 +542,8 @@ impl FsEventWatcher {
                         cancel: None,
                         perform: Some(stop_runloop_perform),
                     };
-                    let stop_source = CFRunLoopSourceCreate(
-                        cf::kCFAllocatorDefault,
-                        0,
-                        &mut stop_source_context,
-                    );
+                    let stop_source =
+                        CFRunLoopSourceCreate(cf::kCFAllocatorDefault, 0, &mut stop_source_context);
                     CFRunLoopAddSource(cur_runloop, stop_source, cf::kCFRunLoopDefaultMode);
 
                     // Retain the runloop so the reference we send to the
@@ -761,7 +758,6 @@ fn test_steam_context_info_send_and_sync() {
     check_send::<StreamContextInfo>();
 }
 
-
 // fsevents does not allow watching more than 4096 paths in one stream, so
 // FSEventStreamStart fails. Regression test for two related shutdown hangs:
 // before propagating the start failure, the runloop thread exited silently
@@ -796,9 +792,13 @@ fn watcher_does_not_hang_after_stream_start_failure() {
             // The stream fails to start here; the error must be surfaced
             // and the watcher left in a stopped state rather than holding a
             // handle to a dead runloop.
-            let commit_error = paths_mut.commit().expect_err("commit should surface start failure");
+            let commit_error = paths_mut
+                .commit()
+                .expect_err("commit should surface start failure");
             assert!(
-                commit_error.to_string().contains("unable to start FSEvent stream"),
+                commit_error
+                    .to_string()
+                    .contains("unable to start FSEvent stream"),
                 "unexpected commit error: {commit_error}"
             );
         }
@@ -867,4 +867,70 @@ fn rapid_watch_unwatch_does_not_hang() {
         .recv_timeout(Duration::from_secs(120))
         .expect("rapid watch/unwatch timed out (lost CFRunLoopStop?)");
     stress_thread.join().expect("stress thread to shut down");
+}
+
+#[test]
+fn stop_source_signaled_before_runloop_run_still_stops_loop() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    struct CFSendWrapper(cf::CFRef);
+    unsafe impl Send for CFSendWrapper {}
+
+    let (handles_tx, handles_rx) = mpsc::channel();
+    let (signaled_tx, signaled_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+
+    let loop_thread = thread::spawn(move || {
+        unsafe {
+            let cur_runloop = cf::CFRunLoopGetCurrent();
+
+            let mut stop_source_context = CFRunLoopSourceContext {
+                version: 0,
+                info: ptr::null_mut(),
+                retain: None,
+                release: None,
+                copy_description: None,
+                equal: None,
+                hash: None,
+                schedule: None,
+                cancel: None,
+                perform: Some(stop_runloop_perform),
+            };
+            let stop_source =
+                CFRunLoopSourceCreate(cf::kCFAllocatorDefault, 0, &mut stop_source_context);
+            CFRunLoopAddSource(cur_runloop, stop_source, cf::kCFRunLoopDefaultMode);
+            CFRetain(cur_runloop);
+
+            handles_tx
+                .send((CFSendWrapper(cur_runloop), CFSendWrapper(stop_source)))
+                .expect("send runloop handles");
+
+            signaled_rx
+                .recv()
+                .expect("wait for the stop source to be signaled");
+
+            cf::CFRunLoopRun();
+
+            CFRunLoopSourceInvalidate(stop_source);
+        }
+        let _ = done_tx.send(());
+    });
+
+    let (runloop, stop_source) = handles_rx.recv().expect("receive runloop handles");
+    unsafe {
+        CFRunLoopSourceSignal(stop_source.0);
+        CFRunLoopWakeUp(runloop.0);
+    }
+    signaled_tx.send(()).expect("release the loop thread");
+
+    done_rx
+        .recv_timeout(Duration::from_secs(10))
+        .expect("CFRunLoopRun did not exit; pre-run stop source signal was lost");
+    loop_thread.join().expect("loop thread to shut down");
+
+    unsafe {
+        cf::CFRelease(stop_source.0);
+        cf::CFRelease(runloop.0);
+    }
 }
