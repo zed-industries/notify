@@ -17,7 +17,8 @@
 use crate::paths::{absolute_path, reported_path};
 use crate::{event::*, PathOp};
 use crate::{
-    unbounded, Config, Error, EventHandler, EventKindMask, RecursiveMode, Result, Sender, Watcher,
+    unbounded, Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result,
+    Sender, Watcher,
 };
 use objc2_core_foundation as cf;
 use objc2_core_services as fs;
@@ -627,7 +628,7 @@ impl FsEventWatcher {
                         fs::FSEventStreamInvalidate(stream);
                         fs::FSEventStreamRelease(stream);
                         rl_tx
-                            .send(Err(Error::generic("unable to start FSEvent stream")))
+                            .send(Err(Error::new(ErrorKind::FsEventStreamStart)))
                             .expect("Unable to send error for FSEventStreamStart");
                         return;
                     }
