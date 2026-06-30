@@ -1,6 +1,42 @@
 # Changelog
 
-## notify 9.0.0 (unreleased)
+## unreleased
+
+- FEATURE: [macOS] add `Config::with_fsevent_latency` to configure FSEvents stream latency [#930]
+- FIX: [windows] emit a Remove event when a watched directory is deleted, matching inotify and FSEvents
+- FIX: [windows] surface `ReadDirectoryChangesW` read-start failures [#935]
+- FEATURE: [windows] report created file/folder kinds when they can be determined [#935]
+- CHANGE: [macOS] improve FSEvents callback performance by avoiding unnecessary allocations and repeated handler locking
+- PERF: [kqueue] avoid filesystem walks for recursive kqueue unwatch
+
+[#930]: https://github.com/notify-rs/notify/pull/930
+[#935]: https://github.com/notify-rs/notify/issues/935
+
+## notify 9.0.0-rc.4 (2026-05-02)
+
+- CHANGE: preserve watched path representation in `Event.paths` and `Watcher::watched_paths`; relative watch paths now produce relative event paths consistently across backends [#453] [#740]
+- FIX: [kqueue] stop reporting arbitrary existing child paths for non-recursive directory write events [#644]
+- FIX: replace an existing watch when `watch` is called again for the same path, avoiding duplicate FSEvent paths and leaked Windows watch handles [#708]
+- DOCS: define `Watcher::watch` replacement behavior for an existing backend-resolved path [#708]
+
+## notify 9.0.0-rc.3 (2026-04-16)
+
+- CHANGE: raise MSRV to 1.88
+- FEATURE: add `Watcher::watched_paths` to list active watches as `(PathBuf, RecursiveMode)` pairs across supported backends
+- FIX: [windows] normalize emitted event paths to follow the watched path separator style and trim leading separators; add `Config::with_windows_path_separator_style` for explicit control [#375]
+- FIX: [windows] make `unwatch()` wait until the watch is fully removed so later filesystem changes do not leak events [#730]
+- FIX: [macOS] annotate FSEvents clone-related events with `info = "is: clone"` [#465]
+- FIX: avoid panicking in `unwatch` when internal mutexes are poisoned
+- CHANGE: add `#[must_use]` annotations to builder, constructor, and getter-style APIs such as `Config`, `PathOp`, and `Error`
+
+[#375]: https://github.com/notify-rs/notify/issues/375
+[#465]: https://github.com/notify-rs/notify/issues/465
+[#730]: https://github.com/notify-rs/notify/issues/730
+[#739]: https://github.com/notify-rs/notify/issues/739
+[#453]: https://github.com/notify-rs/notify/issues/453
+[#740]: https://github.com/notify-rs/notify/issues/740
+[#644]: https://github.com/notify-rs/notify/issues/644
+[#708]: https://github.com/notify-rs/notify/issues/708
 
 ## notify 9.0.0-rc.2 (2026-02-14)
 
@@ -165,7 +201,7 @@
 
 ## notify 5.0.0 (2022-08-28)
 
-For a list of changes when upgrading from v4 see [UPGRADING_V4_TO_V5.md](../UPGRADING_V4_TO_V5.md).
+For a list of changes when upgrading from v4 see [UPGRADING_V4_TO_V5.md](../docs/UPGRADING_V4_TO_V5.md).
 
 Differences to 5.0.0-pre.16:
 

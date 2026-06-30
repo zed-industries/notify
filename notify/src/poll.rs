@@ -3,7 +3,10 @@
 //! Checks the `watch`ed paths periodically to detect changes. This implementation only uses
 //! Rust stdlib APIs and should work on all of the platforms it supports.
 
-use crate::{unbounded, Config, Error, EventHandler, Receiver, RecursiveMode, Sender, Watcher};
+use crate::{
+    paths::{absolute_path, WatchPath},
+    unbounded, Config, Error, EventHandler, Receiver, RecursiveMode, Sender, Watcher,
+};
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -69,7 +72,8 @@ use data::{DataBuilder, WatchData};
 mod data {
     use crate::{
         event::{CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind, RemoveKind},
-        EventHandler,
+        paths::{reported_path, WatchPath},
+        EventHandler, RecursiveMode,
     };
     use notify_types::event::EventKindMask;
     use std::{
@@ -142,7 +146,7 @@ mod data {
         /// the path location. (e.g., not found).
         pub(super) fn build_watch_data(
             &self,
-            root: PathBuf,
+            root: WatchPath,
             is_recursive: bool,
             follow_symlinks: bool,
         ) -> Option<WatchData> {
@@ -168,6 +172,7 @@ mod data {
     pub(super) struct WatchData {
         // config part, won't change.
         root: PathBuf,
+        requested_root: PathBuf,
         is_recursive: bool,
         follow_symlinks: bool,
 
@@ -183,7 +188,7 @@ mod data {
         /// This function may send event by `data_builder.emitter`.
         fn new(
             data_builder: &DataBuilder,
-            root: PathBuf,
+            root: WatchPath,
             is_recursive: bool,
             follow_symlinks: bool,
         ) -> Option<Self> {
@@ -205,14 +210,15 @@ mod data {
             //
             // FIXME: Can we always allow to watch a path, even file not
             // found at this path?
-            if let Err(e) = fs::metadata(&root) {
-                data_builder.emitter.emit_io_err(e, Some(&root));
+            if let Err(e) = fs::metadata(&root.absolute) {
+                data_builder.emitter.emit_io_err(e, Some(&root.requested));
                 return None;
             }
 
             let all_path_data = Self::scan_all_path_data(
                 data_builder,
-                root.clone(),
+                root.absolute.clone(),
+                root.requested.clone(),
                 is_recursive,
                 follow_symlinks,
                 true,
@@ -220,7 +226,8 @@ mod data {
             .collect();
 
             Some(Self {
-                root,
+                root: root.absolute,
+                requested_root: root.requested,
                 is_recursive,
                 follow_symlinks,
                 all_path_data,
@@ -237,18 +244,28 @@ mod data {
             for (path, new_path_data) in Self::scan_all_path_data(
                 data_builder,
                 self.root.clone(),
+                self.requested_root.clone(),
                 self.is_recursive,
                 self.follow_symlinks,
                 false,
             ) {
-                let old_path_data = self
-                    .all_path_data
-                    .insert(path.clone(), new_path_data.clone());
+                let event_kind = if let Some(old_path_data) = self.all_path_data.get_mut(&path) {
+                    let event_kind =
+                        PathData::compare_to_kind(Some(&*old_path_data), Some(&new_path_data));
+                    *old_path_data = new_path_data;
+                    event_kind
+                } else {
+                    let event_kind = PathData::compare_to_kind(None, Some(&new_path_data));
+                    self.all_path_data.insert(path.clone(), new_path_data);
+                    event_kind
+                };
 
-                // emit event
-                let event =
-                    PathData::compare_to_event(path, old_path_data.as_ref(), Some(&new_path_data));
-                if let Some(event) = event {
+                if let Some(event_kind) = event_kind {
+                    let event = Event::new(event_kind).add_path(reported_path(
+                        &self.root,
+                        &self.requested_root,
+                        &path,
+                    ));
                     data_builder.emitter.emit_ok(event);
                 }
             }
@@ -265,9 +282,12 @@ mod data {
             for path in disappeared_paths {
                 let old_path_data = self.all_path_data.remove(&path);
 
-                // emit event
-                let event = PathData::compare_to_event(path, old_path_data.as_ref(), None);
-                if let Some(event) = event {
+                if let Some(event_kind) = PathData::compare_to_kind(old_path_data.as_ref(), None) {
+                    let event = Event::new(event_kind).add_path(reported_path(
+                        &self.root,
+                        &self.requested_root,
+                        &path,
+                    ));
                     data_builder.emitter.emit_ok(event);
                 }
             }
@@ -281,6 +301,7 @@ mod data {
         fn scan_all_path_data(
             data_builder: &'_ DataBuilder,
             root: PathBuf,
+            requested_root: PathBuf,
             is_recursive: bool,
             follow_symlinks: bool,
             // whether this is an initial scan, used only for events
@@ -291,7 +312,7 @@ mod data {
             // so we can use single logic to do the both file & dir's jobs.
             //
             // See: https://docs.rs/walkdir/2.0.1/walkdir/struct.WalkDir.html#method.new
-            WalkDir::new(root)
+            WalkDir::new(root.clone())
                 .follow_links(follow_symlinks)
                 .max_depth(Self::dir_scan_depth(is_recursive))
                 .into_iter()
@@ -318,7 +339,11 @@ mod data {
                         if is_initial {
                             // emit initial scans
                             if let Some(ref emitter) = data_builder.scan_emitter {
-                                emitter.borrow_mut().handle_event(Ok(path.clone()));
+                                emitter.borrow_mut().handle_event(Ok(reported_path(
+                                    &root,
+                                    &requested_root,
+                                    &path,
+                                )));
                             }
                         }
                         let meta_path = MetaPath::from_parts_unchecked(path, metadata);
@@ -342,6 +367,18 @@ mod data {
             } else {
                 1
             }
+        }
+
+        pub(super) fn recursive_mode(&self) -> RecursiveMode {
+            if self.is_recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            }
+        }
+
+        pub(super) fn requested_root(&self) -> &Path {
+            &self.requested_root
         }
     }
 
@@ -376,19 +413,6 @@ mod data {
 
                 last_check: data_builder.now,
             }
-        }
-
-        /// Get [`Event`] by compare two optional [`PathData`].
-        fn compare_to_event<P>(
-            path: P,
-            old: Option<&PathData>,
-            new: Option<&PathData>,
-        ) -> Option<Event>
-        where
-            P: Into<PathBuf>,
-        {
-            Self::compare_to_kind(old, new)
-                .map(|event_kind| Event::new(event_kind).add_path(path.into()))
         }
 
         fn compare_to_kind(old: Option<&PathData>, new: Option<&PathData>) -> Option<EventKind> {
@@ -666,37 +690,42 @@ impl PollWatcher {
     ///
     /// QUESTION: this function never return an Error, is it as intend?
     /// Please also consider the IO Error event problem.
-    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) {
+    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> crate::Result<()> {
+        let watch_path = WatchPath::new(path)?;
+
         // HINT: Make sure always lock in the same order to avoid deadlock.
         //
         // FIXME: inconsistent: some place mutex poison cause panic, some place just ignore.
-        if let (Ok(mut watches), Ok(mut data_builder)) =
-            (self.watches.lock(), self.data_builder.lock())
-        {
-            data_builder.update_timestamp();
+        let mut watches = self.watches.lock().unwrap_or_else(|e| e.into_inner());
+        let mut data_builder = self.data_builder.lock().unwrap_or_else(|e| e.into_inner());
 
-            let watch_data = data_builder.build_watch_data(
-                path.to_path_buf(),
-                recursive_mode.is_recursive(),
-                self.follow_sylinks,
-            );
+        data_builder.update_timestamp();
 
-            // if create watch_data successful, add it to watching list.
-            if let Some(watch_data) = watch_data {
-                watches.insert(path.to_path_buf(), watch_data);
-            }
+        let watch_data = data_builder.build_watch_data(
+            watch_path.clone(),
+            recursive_mode.is_recursive(),
+            self.follow_sylinks,
+        );
+
+        // if create watch_data successful, add it to watching list.
+        if let Some(watch_data) = watch_data {
+            watches.insert(watch_path.absolute, watch_data);
         }
+
+        Ok(())
     }
 
     /// Unwatch a path.
     ///
     /// Return `Err(_)` if given path has't be monitored.
     fn unwatch_inner(&mut self, path: &Path) -> crate::Result<()> {
+        let path = absolute_path(path)?;
+
         // FIXME: inconsistent: some place mutex poison cause panic, some place just ignore.
         self.watches
             .lock()
-            .unwrap()
-            .remove(path)
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&path)
             .map(|_| ())
             .ok_or_else(crate::Error::watch_not_found)
     }
@@ -709,13 +738,19 @@ impl Watcher for PollWatcher {
     }
 
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> crate::Result<()> {
-        self.watch_inner(path, recursive_mode);
-
-        Ok(())
+        self.watch_inner(path, recursive_mode)
     }
 
     fn unwatch(&mut self, path: &Path) -> crate::Result<()> {
         self.unwatch_inner(path)
+    }
+
+    fn watched_paths(&self) -> crate::Result<Vec<(PathBuf, RecursiveMode)>> {
+        let watches = self.watches.lock().map_err(crate::Error::from)?;
+        Ok(watches
+            .values()
+            .map(|watch| (watch.requested_root().to_path_buf(), watch.recursive_mode()))
+            .collect())
     }
 
     fn kind() -> crate::WatcherKind {
@@ -732,7 +767,7 @@ impl Drop for PollWatcher {
 #[cfg(test)]
 mod tests {
     use super::PollWatcher;
-    use crate::test::*;
+    use crate::{test::*, Config, RecursiveMode, Watcher};
 
     fn watcher() -> (TestWatcher<PollWatcher>, Receiver) {
         poll_watcher_channel()
@@ -742,6 +777,93 @@ mod tests {
     fn poll_watcher_is_send_and_sync() {
         fn check<T: Send + Sync>() {}
         check::<PollWatcher>();
+    }
+
+    #[test]
+    fn unwatch_with_poisoned_mutex_does_not_panic() {
+        use std::{path::Path, sync::Arc};
+
+        let mut watcher = PollWatcher::new(|_| {}, Config::default()).expect("create watcher");
+
+        let watches = Arc::clone(&watcher.watches);
+        let _ = std::thread::spawn(move || {
+            let _guard = watches.lock().expect("lock watches");
+            panic!("poison watches mutex for test");
+        })
+        .join();
+
+        // Ensure poisoned mutex recovery path does not panic in unwatch_inner.
+        let result = watcher.unwatch_inner(Path::new("/path/that/is/not/watched"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn watched_paths_reflect_watch_and_unwatch() {
+        let tmpdir = testdir();
+        let dir_a = tmpdir.path().join("a");
+        let dir_b = tmpdir.path().join("b");
+        std::fs::create_dir(&dir_a).expect("create dir a");
+        std::fs::create_dir(&dir_b).expect("create dir b");
+
+        let mut watcher = PollWatcher::new(|_| {}, Config::default()).expect("create watcher");
+
+        watcher
+            .watch(&dir_a, RecursiveMode::Recursive)
+            .expect("watch dir a");
+        watcher
+            .watch(&dir_b, RecursiveMode::NonRecursive)
+            .expect("watch dir b");
+
+        let watched = watcher.watched_paths().expect("list watched paths");
+        assert!(watched.contains(&(
+            dir_a.canonicalize().expect("canonicalize dir a"),
+            RecursiveMode::Recursive,
+        )));
+        assert!(watched.contains(&(
+            dir_b.canonicalize().expect("canonicalize dir b"),
+            RecursiveMode::NonRecursive,
+        )));
+
+        watcher.unwatch(&dir_a).expect("unwatch dir a");
+
+        let watched = watcher
+            .watched_paths()
+            .expect("list watched paths after unwatch");
+        assert!(!watched.contains(&(
+            dir_a.canonicalize().expect("canonicalize dir a"),
+            RecursiveMode::Recursive,
+        )));
+        assert!(watched.contains(&(
+            dir_b.canonicalize().expect("canonicalize dir b"),
+            RecursiveMode::NonRecursive,
+        )));
+    }
+
+    #[test]
+    fn rewatching_same_path_replaces_recursive_mode() {
+        let tmpdir = testdir();
+        let root = tmpdir.path().canonicalize().expect("canonicalize root");
+
+        let mut watcher = PollWatcher::new(|_| {}, Config::default()).expect("create watcher");
+
+        watcher
+            .watch(tmpdir.path(), RecursiveMode::Recursive)
+            .expect("watch recursively");
+        watcher
+            .watch(tmpdir.path(), RecursiveMode::NonRecursive)
+            .expect("watch non-recursively");
+
+        let watched = watcher.watched_paths().expect("list watched paths");
+        assert!(watched.contains(&(root.clone(), RecursiveMode::NonRecursive)));
+        assert!(!watched.contains(&(root.clone(), RecursiveMode::Recursive)));
+        assert_eq!(
+            watched.iter().filter(|(path, _mode)| path == &root).count(),
+            1
+        );
+
+        watcher.unwatch(tmpdir.path()).expect("unwatch");
+        let watched = watcher.watched_paths().expect("list watched paths");
+        assert!(!watched.iter().any(|(path, _mode)| path == &root));
     }
 
     #[test]
@@ -914,8 +1036,7 @@ mod tests {
             .expect("event should not be an error");
         assert!(
             event.kind.is_create(),
-            "Expected CREATE event, got: {:?}",
-            event
+            "Expected CREATE event, got: {event:?}"
         );
 
         // Modify the file - should NOT generate event (filtered by mask)
@@ -929,8 +1050,7 @@ mod tests {
         let remaining: Vec<_> = rx.try_iter().filter_map(|r| r.ok()).collect();
         assert!(
             !remaining.iter().any(|e| e.kind.is_modify()),
-            "Should not receive MODIFY events with CREATE-only mask, got: {:?}",
-            remaining
+            "Should not receive MODIFY events with CREATE-only mask, got: {remaining:?}"
         );
     }
 }

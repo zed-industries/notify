@@ -5,12 +5,12 @@
 //!
 //! [ref]: https://msdn.microsoft.com/en-us/library/windows/desktop/aa363950(v=vs.85).aspx
 
+use crate::paths::{absolute_path, WatchPath};
 use crate::{bounded, unbounded, BoundSender, Config, Receiver, Sender};
 use crate::{event::*, WatcherKind};
-use crate::{Error, EventHandler, RecursiveMode, Result, Watcher};
+use crate::{Error, EventHandler, RecursiveMode, Result, Watcher, WindowsPathSeparatorStyle};
 use std::alloc;
 use std::collections::HashMap;
-use std::env;
 use std::ffi::OsString;
 use std::os::raw::c_void;
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
@@ -39,12 +39,98 @@ use windows_sys::Win32::System::IO::{CancelIo, OVERLAPPED};
 
 const BUF_SIZE: u32 = 16384;
 
+#[derive(Clone, Copy)]
+enum SeparatorStyle {
+    Slash,
+    Backslash,
+}
+
+impl SeparatorStyle {
+    fn resolve(configured_style: WindowsPathSeparatorStyle, path: &Path) -> Self {
+        match configured_style {
+            WindowsPathSeparatorStyle::Auto => Self::from_path(path),
+            WindowsPathSeparatorStyle::Slash => Self::Slash,
+            WindowsPathSeparatorStyle::Backslash => Self::Backslash,
+        }
+    }
+
+    fn from_path(path: &Path) -> Self {
+        let mut has_forward_slash = false;
+        let mut has_backslash = false;
+
+        for ch in path.as_os_str().encode_wide() {
+            if ch == '/' as u16 {
+                has_forward_slash = true;
+            } else if ch == '\\' as u16 {
+                has_backslash = true;
+            }
+
+            if has_forward_slash && has_backslash {
+                return Self::Backslash;
+            }
+        }
+
+        if has_forward_slash {
+            Self::Slash
+        } else {
+            Self::Backslash
+        }
+    }
+
+    fn as_u16(self) -> u16 {
+        match self {
+            Self::Slash => '/' as u16,
+            Self::Backslash => '\\' as u16,
+        }
+    }
+}
+
+fn trim_leading_separators(path: &[u16]) -> &[u16] {
+    let mut start = 0;
+    while start < path.len() && (path[start] == '/' as u16 || path[start] == '\\' as u16) {
+        start += 1;
+    }
+    &path[start..]
+}
+
+fn windows_namespace_prefix_len(path: &[u16]) -> usize {
+    let is_separator = |ch: u16| ch == '/' as u16 || ch == '\\' as u16;
+
+    if path.len() >= 4
+        && is_separator(path[0])
+        && is_separator(path[1])
+        && (path[2] == '?' as u16 || path[2] == '.' as u16)
+        && is_separator(path[3])
+    {
+        4
+    } else {
+        0
+    }
+}
+
+fn normalize_path_separators(path: PathBuf, separator_style: SeparatorStyle) -> PathBuf {
+    let separator = separator_style.as_u16();
+    let mut encoded_path: Vec<u16> = path.as_os_str().encode_wide().collect();
+    let prefix_len = windows_namespace_prefix_len(&encoded_path);
+
+    for ch in encoded_path.iter_mut().skip(prefix_len) {
+        if *ch == '/' as u16 || *ch == '\\' as u16 {
+            *ch = separator;
+        }
+    }
+
+    PathBuf::from(OsString::from_wide(&encoded_path))
+}
+
 #[derive(Clone)]
 struct ReadData {
+    watch_path: PathBuf,   // key used in the server watch map
     dir: PathBuf,          // directory that is being watched
-    file: Option<PathBuf>, // if a file is being watched, this is its full path
+    reported_dir: PathBuf, // directory prefix used in emitted event paths
+    file: Option<PathBuf>, // if a file is being watched, this is its reported path
     complete_sem: HANDLE,
     is_recursive: bool,
+    separator_style: SeparatorStyle,
 }
 
 struct ReadDirectoryRequest {
@@ -58,13 +144,20 @@ struct ReadDirectoryRequest {
 
 impl ReadDirectoryRequest {
     fn unwatch(&self) {
-        let _ = self.action_tx.send(Action::Unwatch(self.data.dir.clone()));
+        let _ = self
+            .action_tx
+            .send(Action::Unwatch(self.data.watch_path.clone()));
     }
 }
 
 enum Action {
-    Watch(PathBuf, RecursiveMode),
+    Watch(WatchPath, RecursiveMode, SeparatorStyle),
+    // Internal self-unwatch from the completion callback.
     Unwatch(PathBuf),
+    // Public `Watcher::unwatch` path. This variant must ack only after `remove_watch` finishes so
+    // the caller does not observe events after `unwatch()` returns.
+    UnwatchAck(PathBuf),
+    GetWatchedPaths(Sender<Vec<(PathBuf, RecursiveMode)>>),
     Stop,
     Configure(Config, BoundSender<Result<bool>>),
 }
@@ -78,6 +171,8 @@ pub enum MetaEvent {
 struct WatchState {
     dir_handle: HANDLE,
     complete_sem: HANDLE,
+    recursive_mode: RecursiveMode,
+    reported_path: PathBuf,
 }
 
 struct ReadDirectoryChangesServer {
@@ -131,11 +226,26 @@ impl ReadDirectoryChangesServer {
 
             while let Ok(action) = self.rx.try_recv() {
                 match action {
-                    Action::Watch(path, recursive_mode) => {
-                        let res = self.add_watch(path, recursive_mode.is_recursive());
+                    Action::Watch(path, recursive_mode, separator_style) => {
+                        let res =
+                            self.add_watch(path, recursive_mode.is_recursive(), separator_style);
                         let _ = self.cmd_tx.send(res);
                     }
                     Action::Unwatch(path) => self.remove_watch(path),
+                    Action::UnwatchAck(path) => {
+                        self.remove_watch(path.clone());
+                        let _ = self.cmd_tx.send(Ok(path));
+                    }
+                    Action::GetWatchedPaths(tx) => {
+                        let _ = tx.send(
+                            self.watches
+                                .iter()
+                                .map(|(_path, state)| {
+                                    (state.reported_path.clone(), state.recursive_mode)
+                                })
+                                .collect(),
+                        );
+                    }
                     Action::Stop => {
                         stopped = true;
                         for ws in self.watches.values() {
@@ -168,22 +278,34 @@ impl ReadDirectoryChangesServer {
         }
     }
 
-    fn add_watch(&mut self, path: PathBuf, is_recursive: bool) -> Result<PathBuf> {
+    fn add_watch(
+        &mut self,
+        path: WatchPath,
+        is_recursive: bool,
+        separator_style: SeparatorStyle,
+    ) -> Result<PathBuf> {
         // path must exist and be either a file or directory
-        if !path.is_dir() && !path.is_file() {
+        if !path.absolute.is_dir() && !path.absolute.is_file() {
             return Err(
                 Error::generic("Input watch path is neither a file nor a directory.")
-                    .add_path(path),
+                    .add_path(path.requested),
             );
         }
 
         let (watching_file, dir_target) = {
-            if path.is_dir() {
-                (false, path.clone())
+            if path.absolute.is_dir() {
+                (false, path.absolute.clone())
             } else {
                 // emulate file watching by watching the parent directory
-                (true, path.parent().unwrap().to_path_buf())
+                (true, path.absolute.parent().unwrap().to_path_buf())
             }
+        };
+        let reported_dir = if watching_file {
+            path.requested
+                .parent()
+                .map_or_else(PathBuf::new, Path::to_path_buf)
+        } else {
+            path.requested.clone()
         };
 
         let encoded_path: Vec<u16> = dir_target
@@ -209,45 +331,69 @@ impl ReadDirectoryChangesServer {
                         "You attempted to watch a single file, but parent \
                          directory could not be opened.",
                     )
-                    .add_path(path)
+                    .add_path(path.requested)
                 } else {
                     // TODO: Call GetLastError for better error info?
-                    Error::path_not_found().add_path(path)
+                    Error::path_not_found().add_path(path.requested)
                 });
             }
         }
         let wf = if watching_file {
-            Some(path.clone())
+            Some(normalize_path_separators(
+                path.requested.clone(),
+                separator_style,
+            ))
         } else {
             None
         };
+        let watched_path = path.absolute.clone();
         // every watcher gets its own semaphore to signal completion
         let semaphore = unsafe { CreateSemaphoreW(ptr::null_mut(), 0, 1, ptr::null_mut()) };
         if semaphore.is_null() || semaphore == INVALID_HANDLE_VALUE {
             unsafe {
                 CloseHandle(handle);
             }
-            return Err(Error::generic("Failed to create semaphore for watch.").add_path(path));
+            return Err(
+                Error::generic("Failed to create semaphore for watch.").add_path(path.requested)
+            );
         }
         let rd = ReadData {
+            watch_path: watched_path.clone(),
             dir: dir_target,
+            reported_dir,
             file: wf,
             complete_sem: semaphore,
             is_recursive,
+            separator_style,
         };
         let ws = WatchState {
             dir_handle: handle,
             complete_sem: semaphore,
+            recursive_mode: if is_recursive {
+                RecursiveMode::Recursive
+            } else {
+                RecursiveMode::NonRecursive
+            },
+            reported_path: path.requested,
         };
-        self.watches.insert(path.clone(), ws);
-        start_read(
+        if let Err(err) = start_read(
             &rd,
             self.event_handler.clone(),
             self.event_kinds,
             handle,
             self.tx.clone(),
-        );
-        Ok(path)
+        ) {
+            unsafe {
+                CloseHandle(handle);
+                CloseHandle(semaphore);
+            }
+            return Err(err);
+        }
+        if let Some(ws) = self.watches.remove(&watched_path) {
+            stop_watch(&ws, &self.meta_tx);
+        }
+        self.watches.insert(watched_path.clone(), ws);
+        Ok(watched_path)
     }
 
     fn remove_watch(&mut self, path: PathBuf) {
@@ -283,7 +429,7 @@ fn start_read(
     event_kinds: EventKindMask,
     handle: HANDLE,
     action_tx: Sender<Action>,
-) {
+) -> Result<()> {
     let request = Box::new(ReadDirectoryRequest {
         event_handler,
         event_kinds,
@@ -329,15 +475,24 @@ fn start_read(
         );
 
         if ret == 0 {
+            let err = std::io::Error::last_os_error();
             // error reading. retransmute request memory to allow drop.
             // Because of the error, ownership of the `overlapped` alloc was not passed
             // over to `ReadDirectoryChangesW`.
             // So we can claim ownership back.
             let _overlapped = Box::from_raw(overlapped);
             let request = Box::from_raw(request);
+            let path = request
+                .data
+                .file
+                .clone()
+                .unwrap_or_else(|| request.data.reported_dir.clone());
             ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+            return Err(Error::io(err).add_path(path));
         }
     }
+
+    Ok(())
 }
 
 unsafe extern "system" fn handle_event(
@@ -348,6 +503,13 @@ unsafe extern "system" fn handle_event(
     let overlapped: Box<OVERLAPPED> = Box::from_raw(overlapped);
     let request: Box<ReadDirectoryRequest> = Box::from_raw(overlapped.hEvent as *mut _);
 
+    fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
+        if let Ok(mut guard) = event_handler.lock() {
+            let f: &mut dyn EventHandler = &mut *guard;
+            f.handle_event(res);
+        }
+    }
+
     match error_code {
         ERROR_OPERATION_ABORTED => {
             // received when dir is unwatched or watcher is shutdown; return and let overlapped/request get drop-cleaned
@@ -355,9 +517,25 @@ unsafe extern "system" fn handle_event(
             return;
         }
         ERROR_ACCESS_DENIED => {
-            // This could happen when the watched directory is deleted or trashed, first check if it's the case.
-            // If so, unwatch the directory and return, otherwise, continue to handle the event.
-            if !request.data.dir.exists() {
+            // ReadDirectoryChangesW returns ERROR_ACCESS_DENIED both when the handle
+            // has been invalidated (usually because the watched dir was deleted) and
+            // when access has been revoked; use successful dir absence to tell which.
+            // For directory watches, emit a Remove event so consumers learn the
+            // watched path is gone, matching inotify IN_DELETE_SELF (#540) and
+            // FSEvents ROOT_CHANGED+ITEM_REMOVED. File watches are excluded because
+            // FILE_ACTION_REMOVED already fires for the file's parent.
+            if matches!(request.data.dir.try_exists(), Ok(false)) {
+                if request.data.file.is_none() {
+                    const KIND: EventKind = EventKind::Remove(RemoveKind::Folder);
+                    if request.event_kinds.matches(&KIND) {
+                        let path = normalize_path_separators(
+                            request.data.reported_dir.clone(),
+                            request.data.separator_style,
+                        );
+                        let event = Event::new(KIND).add_path(path);
+                        emit_event(&request.event_handler, Ok(event));
+                    }
+                }
                 request.unwatch();
                 ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
                 return;
@@ -380,13 +558,14 @@ unsafe extern "system" fn handle_event(
     }
 
     // Get the next request queued up as soon as possible
-    start_read(
+    let rearm_error = start_read(
         &request.data,
         request.event_handler.clone(),
         request.event_kinds,
         request.handle,
-        request.action_tx,
-    );
+        request.action_tx.clone(),
+    )
+    .err();
 
     // The FILE_NOTIFY_INFORMATION struct has a variable length due to the variable length
     // string as its last member. Each struct contains an offset for getting the next entry in
@@ -405,10 +584,13 @@ unsafe extern "system" fn handle_event(
             len,
         );
         // prepend root to get a full path
-        let path = request
-            .data
-            .dir
-            .join(PathBuf::from(OsString::from_wide(encoded_path)));
+        let relative_path =
+            PathBuf::from(OsString::from_wide(trim_leading_separators(encoded_path)));
+        let absolute_path = request.data.dir.join(&relative_path);
+        let path = normalize_path_separators(
+            request.data.reported_dir.join(relative_path),
+            request.data.separator_style,
+        );
 
         // if we are watching a single file, ignore the event unless the path is exactly
         // the watched file
@@ -425,13 +607,6 @@ unsafe extern "system" fn handle_event(
             );
 
             let newe = Event::new(EventKind::Any).add_path(path);
-
-            fn emit_event(event_handler: &Mutex<dyn EventHandler>, res: Result<Event>) {
-                if let Ok(mut guard) = event_handler.lock() {
-                    let f: &mut dyn EventHandler = &mut *guard;
-                    f.handle_event(res);
-                }
-            }
 
             // Filter events based on EventKindMask
             let event_kinds = request.event_kinds;
@@ -462,7 +637,17 @@ unsafe extern "system" fn handle_event(
                         event_handler(Ok(ev));
                     }
                     FILE_ACTION_ADDED => {
-                        let kind = EventKind::Create(CreateKind::Any);
+                        let kind =
+                            std::fs::metadata(&absolute_path).map_or(CreateKind::Any, |metadata| {
+                                if metadata.is_dir() {
+                                    CreateKind::Folder
+                                } else if metadata.is_file() {
+                                    CreateKind::File
+                                } else {
+                                    CreateKind::Any
+                                }
+                            });
+                        let kind = EventKind::Create(kind);
                         let ev = newe.set_kind(kind);
                         event_handler(Ok(ev));
                     }
@@ -487,6 +672,11 @@ unsafe extern "system" fn handle_event(
         cur_offset = cur_offset.offset(cur_entry.NextEntryOffset as isize);
         cur_entry = ptr::read_unaligned(cur_offset as *const FILE_NOTIFY_INFORMATION);
     }
+
+    if let Some(err) = rearm_error {
+        emit_event(&request.event_handler, Err(err));
+        request.unwatch();
+    }
 }
 
 /// Watcher implementation based on ReadDirectoryChanges
@@ -495,12 +685,27 @@ pub struct ReadDirectoryChangesWatcher {
     tx: Sender<Action>,
     cmd_rx: Receiver<Result<PathBuf>>,
     wakeup_sem: HANDLE,
+    windows_path_separator_style: WindowsPathSeparatorStyle,
 }
 
 impl ReadDirectoryChangesWatcher {
     pub fn create(
         event_handler: Arc<Mutex<dyn EventHandler>>,
         event_kinds: EventKindMask,
+        meta_tx: Sender<MetaEvent>,
+    ) -> Result<ReadDirectoryChangesWatcher> {
+        Self::create_inner(
+            event_handler,
+            event_kinds,
+            WindowsPathSeparatorStyle::Auto,
+            meta_tx,
+        )
+    }
+
+    fn create_inner(
+        event_handler: Arc<Mutex<dyn EventHandler>>,
+        event_kinds: EventKindMask,
+        windows_path_separator_style: WindowsPathSeparatorStyle,
         meta_tx: Sender<MetaEvent>,
     ) -> Result<ReadDirectoryChangesWatcher> {
         let (cmd_tx, cmd_rx) = unbounded();
@@ -522,10 +727,11 @@ impl ReadDirectoryChangesWatcher {
             tx: action_tx,
             cmd_rx,
             wakeup_sem,
+            windows_path_separator_style,
         })
     }
 
-    fn wakeup_server(&mut self) {
+    fn wakeup_server(&self) {
         // breaks the server out of its wait state.  right now this is really just an optimization,
         // so that if you add a watch you don't block for 100ms in watch() while the
         // server sleeps.
@@ -545,8 +751,7 @@ impl ReadDirectoryChangesWatcher {
         let ack_pb = self
             .cmd_rx
             .recv()
-            .map_err(|_| Error::generic("Error receiving from command channel"))?
-            .map_err(|e| Error::generic(&format!("Error in watcher: {:?}", e)))?;
+            .map_err(|_| Error::generic("Error receiving from command channel"))??;
 
         if pb.as_path() != ack_pb.as_path() {
             Err(Error::generic(&format!(
@@ -560,34 +765,32 @@ impl ReadDirectoryChangesWatcher {
     }
 
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        let pb = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            let p = env::current_dir().map_err(Error::io)?;
-            p.join(path)
-        };
+        let separator_style = SeparatorStyle::resolve(self.windows_path_separator_style, path);
+        let pb = WatchPath::new(path)?;
         // path must exist and be either a file or directory
-        if !pb.is_dir() && !pb.is_file() {
+        if !pb.absolute.is_dir() && !pb.absolute.is_file() {
             return Err(Error::generic(
                 "Input watch path is neither a file nor a directory.",
             ));
         }
-        self.send_action_require_ack(Action::Watch(pb.clone(), recursive_mode), &pb)
+        self.send_action_require_ack(
+            Action::Watch(pb.clone(), recursive_mode, separator_style),
+            &pb.absolute,
+        )
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
-        let pb = if path.is_absolute() {
-            path.to_owned()
-        } else {
-            let p = env::current_dir().map_err(Error::io)?;
-            p.join(path)
-        };
-        let res = self
-            .tx
-            .send(Action::Unwatch(pb))
-            .map_err(|_| Error::generic("Error sending to internal channel"));
+        let pb = absolute_path(path)?;
+        self.send_action_require_ack(Action::UnwatchAck(pb.clone()), &pb)
+    }
+
+    fn watched_paths_inner(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
+        let (tx, rx) = unbounded();
+        self.tx
+            .send(Action::GetWatchedPaths(tx))
+            .map_err(|_| Error::generic("Error sending to internal channel"))?;
         self.wakeup_server();
-        res
+        rx.recv().map_err(Error::from)
     }
 }
 
@@ -597,7 +800,12 @@ impl Watcher for ReadDirectoryChangesWatcher {
         // TODO: determine the original purpose of this - can we remove it?
         let (meta_tx, _) = unbounded();
         let event_handler = Arc::new(Mutex::new(event_handler));
-        Self::create(event_handler, config.event_kinds(), meta_tx)
+        Self::create_inner(
+            event_handler,
+            config.event_kinds(),
+            config.windows_path_separator_style(),
+            meta_tx,
+        )
     }
 
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
@@ -612,6 +820,10 @@ impl Watcher for ReadDirectoryChangesWatcher {
         let (tx, rx) = bounded(1);
         self.tx.send(Action::Configure(config, tx))?;
         rx.recv()?
+    }
+
+    fn watched_paths(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
+        self.watched_paths_inner()
     }
 
     fn kind() -> crate::WatcherKind {
@@ -635,9 +847,19 @@ unsafe impl Sync for ReadDirectoryChangesWatcher {}
 
 #[cfg(test)]
 pub mod tests {
-    use tempfile::tempdir;
+    use std::env;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{mpsc, Arc, Mutex};
+    use std::thread;
+    use tempfile::{tempdir, tempdir_in};
 
-    use crate::{test::*, ReadDirectoryChangesWatcher, RecursiveMode, Watcher};
+    use super::{normalize_path_separators, trim_leading_separators, SeparatorStyle};
+    use crate::{
+        test::*, ReadDirectoryChangesWatcher, RecursiveMode, Watcher, WindowsPathSeparatorStyle,
+    };
 
     use std::time::Duration;
 
@@ -670,6 +892,231 @@ pub mod tests {
     }
 
     #[test]
+    fn posix_watch_path_uses_slash_separator_style() {
+        let style = SeparatorStyle::from_path(Path::new("G:/Feature film/"));
+        assert!(matches!(style, SeparatorStyle::Slash));
+    }
+
+    #[test]
+    fn explicit_separator_style_overrides_watch_path_style() {
+        let style = SeparatorStyle::resolve(
+            WindowsPathSeparatorStyle::Backslash,
+            Path::new("G:/Feature film/"),
+        );
+        assert!(matches!(style, SeparatorStyle::Backslash));
+    }
+
+    #[test]
+    fn trim_leading_separators_removes_root_separators() {
+        let input = [
+            '\\' as u16,
+            '/' as u16,
+            's' as u16,
+            'u' as u16,
+            'b' as u16,
+            '\\' as u16,
+            'f' as u16,
+            'i' as u16,
+            'l' as u16,
+            'e' as u16,
+        ];
+        let trimmed = trim_leading_separators(&input);
+        assert_eq!(
+            trimmed,
+            [
+                's' as u16,
+                'u' as u16,
+                'b' as u16,
+                '\\' as u16,
+                'f' as u16,
+                'i' as u16,
+                'l' as u16,
+                'e' as u16,
+            ]
+        );
+    }
+
+    #[test]
+    fn normalize_joined_event_path_for_posix_watch_path() {
+        let dir = PathBuf::from("G:/Feature");
+        let raw_event_name: Vec<u16> = "\\22.mp4".encode_utf16().collect();
+        let relative = PathBuf::from(OsString::from_wide(trim_leading_separators(
+            &raw_event_name,
+        )));
+        let path = normalize_path_separators(dir.join(relative), SeparatorStyle::Slash);
+
+        assert_eq!(path, PathBuf::from("G:/Feature/22.mp4"));
+    }
+
+    #[test]
+    fn normalize_path_separators_keeps_windows_namespace_prefix() {
+        let path = PathBuf::from(r"\\?\C:\very\long\file");
+        let normalized = normalize_path_separators(path, SeparatorStyle::Slash);
+        assert_eq!(normalized, PathBuf::from(r"\\?\C:/very/long/file"));
+    }
+
+    #[test]
+    fn access_denied_existence_error_does_not_emit_remove() {
+        use crate::event::{EventKind, RemoveKind};
+        use std::ptr;
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, ERROR_ACCESS_DENIED, INVALID_HANDLE_VALUE,
+        };
+        use windows_sys::Win32::System::Threading::CreateSemaphoreW;
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+
+        let invalid_path = PathBuf::from(OsString::from_wide(&[0]));
+        assert!(invalid_path.try_exists().is_err());
+
+        let complete_sem = unsafe { CreateSemaphoreW(ptr::null_mut(), 0, 1, ptr::null_mut()) };
+        assert!(!complete_sem.is_null());
+        assert_ne!(complete_sem, INVALID_HANDLE_VALUE);
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (action_tx, _action_rx) = crate::unbounded();
+        let event_handler: Arc<Mutex<dyn crate::EventHandler>> = Arc::new(Mutex::new(event_tx));
+        let request = Box::new(super::ReadDirectoryRequest {
+            event_handler,
+            event_kinds: crate::EventKindMask::ALL,
+            buffer: [0u8; super::BUF_SIZE as usize],
+            handle: INVALID_HANDLE_VALUE,
+            data: super::ReadData {
+                watch_path: invalid_path.clone(),
+                dir: invalid_path.clone(),
+                reported_dir: invalid_path,
+                file: None,
+                complete_sem,
+                is_recursive: false,
+                separator_style: SeparatorStyle::Backslash,
+            },
+            action_tx,
+        });
+        let mut overlapped = Box::new(unsafe { std::mem::zeroed::<OVERLAPPED>() });
+        overlapped.hEvent = Box::into_raw(request) as _;
+
+        unsafe {
+            super::handle_event(ERROR_ACCESS_DENIED, 0, Box::into_raw(overlapped));
+            CloseHandle(complete_sem);
+        }
+
+        let events = event_rx.try_iter().collect::<Vec<_>>();
+        assert!(
+            !events.iter().any(|res| matches!(
+                res,
+                Ok(event) if event.kind == EventKind::Remove(RemoveKind::Folder)
+            )),
+            "unexpected remove event: {events:#?}"
+        );
+    }
+
+    #[test]
+    fn request_unwatch_uses_watch_key_not_read_directory() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+
+        let watch_path = PathBuf::from(r"C:\tmp\file.txt");
+        let read_dir = PathBuf::from(r"C:\tmp");
+        let (event_tx, _event_rx) = mpsc::channel::<crate::Result<crate::Event>>();
+        let (action_tx, action_rx) = crate::unbounded();
+        let event_handler: Arc<Mutex<dyn crate::EventHandler>> = Arc::new(Mutex::new(event_tx));
+
+        let request = super::ReadDirectoryRequest {
+            event_handler,
+            event_kinds: crate::EventKindMask::ALL,
+            buffer: [0u8; super::BUF_SIZE as usize],
+            handle: INVALID_HANDLE_VALUE,
+            data: super::ReadData {
+                watch_path: watch_path.clone(),
+                dir: read_dir,
+                reported_dir: PathBuf::from(r"C:\tmp"),
+                file: Some(watch_path.clone()),
+                complete_sem: INVALID_HANDLE_VALUE,
+                is_recursive: false,
+                separator_style: SeparatorStyle::Backslash,
+            },
+            action_tx,
+        };
+
+        request.unwatch();
+
+        match action_rx.recv().expect("receive action") {
+            super::Action::Unwatch(path) => assert_eq!(path, watch_path),
+            _ => panic!("unexpected action"),
+        }
+    }
+
+    #[test]
+    fn auto_separator_style_keeps_relative_slash_watch_style(
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+        let cwd = env::current_dir()?;
+        let root = tempdir_in(&cwd)?;
+        let watched_dir = root.path().join("sub").join("dir");
+        std::fs::create_dir_all(&watched_dir)?;
+        let watched_file = watched_dir.join("entry");
+        let relative_watch_path = watched_dir.strip_prefix(&cwd)?;
+        let slash_watch_path =
+            PathBuf::from(relative_watch_path.to_string_lossy().replace('\\', "/"));
+
+        let (mut watcher, mut rx) = channel_with_config::<ReadDirectoryChangesWatcher>(
+            ChannelConfig::default().with_watcher_config(
+                crate::Config::default()
+                    .with_windows_path_separator_style(WindowsPathSeparatorStyle::Auto),
+            ),
+        );
+        watcher.watch_nonrecursively(&slash_watch_path);
+
+        std::fs::File::create_new(&watched_file)?;
+
+        let expected_path =
+            normalize_path_separators(slash_watch_path.join("entry"), SeparatorStyle::Slash);
+        rx.wait_unordered([expected(&expected_path).create_file()]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn single_file_filter_matches_with_explicit_separator_style() {
+        let watched_file = PathBuf::from(r"G:\Feature\a.txt");
+        let watched_dir = PathBuf::from(r"G:\Feature");
+
+        let separator_style =
+            SeparatorStyle::resolve(WindowsPathSeparatorStyle::Slash, &watched_file);
+        let normalized_watch_path =
+            normalize_path_separators(watched_file.clone(), separator_style);
+
+        let raw_event_name: Vec<u16> = "\\a.txt".encode_utf16().collect();
+        let relative_path = PathBuf::from(OsString::from_wide(trim_leading_separators(
+            &raw_event_name,
+        )));
+        let normalized_event_path =
+            normalize_path_separators(watched_dir.join(relative_path), separator_style);
+
+        assert_eq!(normalized_watch_path, normalized_event_path);
+        assert_eq!(normalized_event_path, PathBuf::from("G:/Feature/a.txt"));
+    }
+
+    #[test]
+    fn single_file_filter_matches_bare_relative_file() {
+        let watched_file = PathBuf::from("a.txt");
+        let reported_dir = watched_file
+            .parent()
+            .map_or_else(PathBuf::new, Path::to_path_buf);
+        let separator_style =
+            SeparatorStyle::resolve(WindowsPathSeparatorStyle::Auto, &watched_file);
+        let normalized_watch_path =
+            normalize_path_separators(watched_file.clone(), separator_style);
+
+        let raw_event_name: Vec<u16> = "a.txt".encode_utf16().collect();
+        let relative_path = PathBuf::from(OsString::from_wide(trim_leading_separators(
+            &raw_event_name,
+        )));
+        let normalized_event_path =
+            normalize_path_separators(reported_dir.join(relative_path), separator_style);
+
+        assert_eq!(normalized_watch_path, normalized_event_path);
+        assert_eq!(normalized_event_path, watched_file);
+    }
+
+    #[test]
     fn create_file() {
         let tmpdir = testdir();
         let (mut watcher, mut rx) = watcher();
@@ -678,8 +1125,20 @@ pub mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::File::create_new(&path).expect("create");
 
-        rx.wait_ordered_exact([expected(&path).create_any()])
+        rx.wait_ordered_exact([expected(&path).create_file()])
             .ensure_no_tail();
+    }
+
+    #[test]
+    fn recursive_temp_dir_write_reports_created_file_kind() {
+        let tmpdir = tempdir().expect("create tempdir");
+        let (mut watcher, mut rx) = watcher();
+        watcher.watch_recursively(tmpdir.path());
+
+        let path = tmpdir.path().join("new.txt");
+        std::fs::write(&path, b"hello").expect("write");
+
+        rx.wait_ordered([expected(&path).create_file()]);
     }
 
     #[test]
@@ -764,6 +1223,20 @@ pub mod tests {
     }
 
     #[test]
+    fn delete_self_dir() {
+        let tmpdir = testdir();
+        let dir = tmpdir.path().join("dir");
+        std::fs::create_dir(&dir).expect("create");
+
+        let (mut watcher, mut rx) = watcher();
+        watcher.watch_nonrecursively(&dir);
+
+        std::fs::remove_dir(&dir).expect("remove");
+
+        rx.wait_unordered([expected(&dir).remove_folder()]);
+    }
+
+    #[test]
     fn create_write_overwrite() {
         let tmpdir = testdir();
         let (mut watcher, mut rx) = watcher();
@@ -778,7 +1251,7 @@ pub mod tests {
         std::fs::rename(&overwriting_file, &overwritten_file).expect("rename");
 
         rx.wait_ordered_exact([
-            expected(&overwriting_file).create_any(),
+            expected(&overwriting_file).create(),
             expected(&overwriting_file).modify_any().multiple(),
             expected(&overwritten_file).remove_any(),
             expected(&overwriting_file).rename_from(),
@@ -796,7 +1269,7 @@ pub mod tests {
         let path = tmpdir.path().join("entry");
         std::fs::create_dir(&path).expect("create");
 
-        rx.wait_ordered_exact([expected(&path).create_any()])
+        rx.wait_ordered_exact([expected(&path).create_folder()])
             .ensure_no_tail();
     }
 
@@ -913,7 +1386,7 @@ pub mod tests {
         std::fs::remove_file(&new_path).expect("remove");
 
         rx.wait_ordered_exact([
-            expected(&file1).create_any(),
+            expected(&file1).create(),
             expected(&file1).modify_any().multiple(),
             expected(&file2).modify_any().multiple(),
             expected(&file1).rename_from(),
@@ -1023,17 +1496,100 @@ pub mod tests {
         watcher.watch_recursively(&tmpdir);
 
         std::fs::create_dir_all(&nested9).expect("create_dir_all");
-        rx.wait_ordered_exact([
-            expected(&nested1).create_any(),
-            expected(&nested2).create_any(),
-            expected(&nested3).create_any(),
-            expected(&nested4).create_any(),
-            expected(&nested5).create_any(),
-            expected(&nested6).create_any(),
-            expected(&nested7).create_any(),
-            expected(&nested8).create_any(),
-            expected(&nested9).create_any(),
-        ])
-        .ensure_no_tail();
+        rx.wait_ordered([
+            expected(&nested1).create_folder(),
+            expected(&nested2).create_folder(),
+            expected(&nested3).create_folder(),
+            expected(&nested4).create_folder(),
+            expected(&nested5).create_folder(),
+            expected(&nested6).create_folder(),
+            expected(&nested7).create_folder(),
+            expected(&nested8).create_folder(),
+            expected(&nested9).create_folder(),
+        ]);
+    }
+
+    #[test]
+    fn unwatch_waits_for_pending_callback_before_returning() {
+        let tmpdir = testdir();
+        let watched_dir = tmpdir.path().join("watched");
+        std::fs::create_dir(&watched_dir).expect("create watched dir");
+
+        let first = watched_dir.join("new_dir");
+        let second = watched_dir.join("should_not_be_seen");
+        let first_for_handler = first.clone();
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (unwatch_done_tx, unwatch_done_rx) = mpsc::channel();
+        let (finish_tx, finish_rx) = mpsc::channel();
+        let blocked_once = Arc::new(AtomicBool::new(false));
+        let blocked_once_for_handler = blocked_once.clone();
+
+        let mut watcher = ReadDirectoryChangesWatcher::new(
+            move |res: crate::Result<crate::Event>| {
+                if let Ok(event) = &res {
+                    if event.paths.iter().any(|path| path == &first_for_handler)
+                        && !blocked_once_for_handler.swap(true, Ordering::SeqCst)
+                    {
+                        started_tx.send(()).expect("signal callback start");
+                        release_rx.recv().expect("release callback");
+                    }
+                }
+
+                event_tx.send(res).expect("forward event");
+            },
+            crate::Config::default(),
+        )
+        .expect("create watcher");
+        watcher
+            .watch(&watched_dir, RecursiveMode::NonRecursive)
+            .expect("watch dir");
+
+        std::fs::create_dir(&first).expect("create first dir");
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait for callback to block");
+
+        let unwatch_path = watched_dir.clone();
+        let join = thread::spawn(move || {
+            let mut watcher = watcher;
+            let result = watcher.unwatch(&unwatch_path);
+            unwatch_done_tx.send(result).expect("send unwatch result");
+            finish_rx.recv().expect("finish watcher thread");
+        });
+
+        assert!(
+            unwatch_done_rx
+                .recv_timeout(Duration::from_millis(100))
+                .is_err(),
+            "unwatch returned before the pending callback finished"
+        );
+
+        release_tx.send(()).expect("release callback");
+        unwatch_done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wait for unwatch result")
+            .expect("unwatch dir");
+
+        std::fs::create_dir(&second).expect("create second dir");
+
+        let first_event = event_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive first event")
+            .expect("first event result");
+        assert_eq!(first_event, expected(&first).create_folder());
+
+        while let Ok(res) = event_rx.recv_timeout(Duration::from_millis(200)) {
+            let event = res.expect("event result");
+            assert!(
+                !event.paths.iter().any(|path| path == &second),
+                "unexpected event after unwatch: {event:#?}"
+            );
+        }
+
+        finish_tx.send(()).expect("finish watcher thread");
+        join.join().expect("join watcher thread");
     }
 }

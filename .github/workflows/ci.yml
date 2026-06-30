@@ -11,16 +11,38 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: read
+
 jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+        with:
+          advanced-security: false
+          annotations: true
+          version: v1.24.1
+
   # Code quality checks
   quality:
     name: Quality Checks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -29,7 +51,7 @@ jobs:
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Install typos-cli
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
+        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
           tool: typos-cli
 
@@ -37,7 +59,7 @@ jobs:
         run: typos
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
+        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
           tool: cargo-deny
 
@@ -45,7 +67,7 @@ jobs:
         run: cargo deny check
 
       - name: Install cargo-machete
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
+        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
           tool: cargo-machete
 
@@ -61,7 +83,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        rust: [stable, nightly, 1.85]
+        rust: [stable, nightly, 1.88]
         include:
           # MacOS with fsevent
           - os: macos-latest
@@ -71,7 +93,7 @@ jobs:
             rust: nightly
             features: "--no-default-features --features macos_fsevent"
           - os: macos-latest
-            rust: 1.85
+            rust: 1.88
             features: "--no-default-features --features macos_fsevent"
           # MacOS with kqueue
           - os: macos-latest
@@ -81,11 +103,13 @@ jobs:
             rust: nightly
             features: "--no-default-features --features macos_kqueue"
           - os: macos-latest
-            rust: 1.85
+            rust: 1.88
             features: "--no-default-features --features macos_kqueue"
 
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Remove rust-toolchain.toml (Unix)
         if: runner.os != 'Windows'
@@ -99,29 +123,61 @@ jobs:
           }
 
       - name: Install Rust ${{ matrix.rust }}
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ matrix.rust }}
+        run: |
+          rustup override set ${{ matrix.rust }}
+          rustup update ${{ matrix.rust }}
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --verbose ${{ matrix.features }}
 
       - name: Build examples
-        run: cargo build --examples --verbose
+        run: cargo build --examples --verbose ${{ matrix.features }}
 
       - name: Run tests
-        run: cargo test --verbose
+        run: cargo test --workspace --exclude examples --verbose ${{ matrix.features }}
         
       - name: Run tests with futures
         if: matrix.rust == 'stable'
-        run: cargo test --verbose --features futures
+        run: cargo test --workspace --exclude examples --verbose ${{ matrix.features }} --features futures
 
       - name: Run tests with tokio
         if: matrix.rust == 'stable'
-        run: cargo test --verbose --features tokio
+        run: cargo test --workspace --exclude examples --verbose ${{ matrix.features }} --features tokio
+
+  # FreeBSD
+  freebsd:
+    name: FreeBSD - ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    needs: quality
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [stable, nightly, 1.88]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Test in FreeBSD VM
+        uses: vmactions/freebsd-vm@b84ab5559b5a1bb4b8ee2737d2506a16e1737636 # v1.4.8
+        with:
+          release: "14.3"
+          envs: "CARGO_TERM_COLOR RUST_BACKTRACE"
+          usesh: true
+          prepare: |
+            pkg install -y curl
+          run: |
+            rm -f rust-toolchain.toml
+            curl https://sh.rustup.rs -sSf | sh -s -- -y --profile=minimal --default-toolchain ${{ matrix.rust }}
+            . $HOME/.cargo/env
+            cargo --version
+            rustc --version
+            cargo build --verbose
+            cargo build --examples --verbose
+            cargo test --verbose
 
   # Android cross-compilation
   android:
@@ -129,21 +185,24 @@ jobs:
     runs-on: ubuntu-latest
     needs: quality
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
 
       - name: Remove rust-toolchain.toml
         run: rm -f rust-toolchain.toml
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: armv7-linux-androideabi, aarch64-linux-android
+        run: |
+          rustup override set stable
+          rustup update stable
+          rustup target add armv7-linux-androideabi aarch64-linux-android
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2.8.2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
 
       - name: Install cargo-ndk
-        uses: taiki-e/install-action@288875dd3d64326724fa6d9593062d9f8ba0b131 # v2.67.30
+        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8 # v2.75.28
         with:
           tool: cargo-ndk
 
@@ -165,9 +224,10 @@ jobs:
   #       run: rm -f rust-toolchain.toml
 
   #     - name: Install Rust
-  #       uses: dtolnay/rust-toolchain@nightly
-  #       with:
-  #         targets: wasm32-wasip2
+  #       run: |
+  #       rustup override set stable
+  #       rustup update stable
+  #       rustup target wasm32-wasip2
 
   #     - name: Cache dependencies
   #       uses: Swatinem/rust-cache@v2

@@ -1,11 +1,34 @@
 # Changelog
-## debouncer-full 0.7.1 (unreleased)
 
+## unreleased
+
+- PERF: park the debouncer thread to avoid idle polling [#933]
+
+[#933]: https://github.com/notify-rs/notify/pull/933
+
+## debouncer-full 0.8.0-rc.2 (2026-05-02)
+
+- CHANGE: upgrade `notify` to 9.0.0-rc.4
+- CHANGE: emit `remove` events even if a file was created and then removed (because macOS repeats the "create" event) [#900] **breaking**
+- CHANGE: speed up debouncer root tracking for large numbers of watched paths while preserving recursive matching for overlapping roots [#913]
+
+[#900]: https://github.com/notify-rs/notify/issues/900
+[#913]: https://github.com/notify-rs/notify/pull/913
+
+## debouncer-full 0.8.0-rc.1 (2026-04-16)
+
+- CHANGE: raise MSRV to 1.88
+- CHANGE: upgrade `notify` to 9.0.0-rc.3
+- CHANGE: add `#[must_use]` annotations to cache constructors and watcher kind accessors
+- CHANGE: use `HashMap::extract_if` to reduce debouncer flush overhead
+- CHANGE: speed up debouncer event flushing and file ID cache lookups while preserving stable path ordering for equal-timestamp events
 - FEATURE: impl `EventHandler` for `futures::channel::mpsc::UnboundedSender` and `tokio::sync::mpsc::UnboundedSender` behind the `futures` and `tokio` feature flags [#767]
 - FEATURE: add support of a watcher's method `update_paths`  [#705]
+- FEATURE: add `Debouncer::watched_paths` for `Debouncer` [#710]
 
 [#767]: https://github.com/notify-rs/notify/pull/767
 [#705]: https://github.com/notify-rs/notify/pull/705
+[#710]: https://github.com/notify-rs/notify/issues/710
 
 ## debouncer-full 0.7.0 (2026-01-23)
 
