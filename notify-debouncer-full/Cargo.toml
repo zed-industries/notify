@@ -1,6 +1,6 @@
 [package]
 name = "notify-debouncer-full"
-version = "0.8.0-rc.2"
+version = "0.7.0"
 description = "notify event debouncer optimized for ease of use"
 documentation = "https://docs.rs/notify-debouncer-full"
 authors = ["Daniel Faust <hessijames@gmail.com>"]
@@ -34,7 +34,6 @@ tokio = { workspace = true, optional = true }
 file-id.workspace = true
 walkdir.workspace = true
 log.workspace = true
-rustc-hash = "2.1.2"
 
 [dev-dependencies]
 pretty_assertions.workspace = true

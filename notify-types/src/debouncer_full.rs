@@ -19,7 +19,6 @@ pub struct DebouncedEvent {
 }
 
 impl DebouncedEvent {
-    #[must_use]
     pub fn new(event: Event, time: Instant) -> Self {
         Self { event, time }
     }
