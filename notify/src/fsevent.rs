@@ -363,16 +363,14 @@ impl FsEventWatcher {
     }
 
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        self.stop();
         let result = self.append_path(path, recursive_mode);
-        self.run()?;
+        self.restart()?;
         result
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
-        self.stop();
         let result = self.remove_path(path);
-        self.run()?;
+        self.restart()?;
         result
     }
 
@@ -380,8 +378,6 @@ impl FsEventWatcher {
         &mut self,
         ops: Vec<crate::PathOp>,
     ) -> crate::StdResult<(), crate::UpdatePathsError> {
-        self.stop();
-
         let result = crate::update_paths(ops, |op| match op {
             crate::PathOp::Watch(path, config) => self
                 .append_path(&path, config.recursive_mode())
@@ -391,7 +387,7 @@ impl FsEventWatcher {
                 .map_err(|e| (PathOp::Unwatch(path), e)),
         });
 
-        match self.run() {
+        match self.restart() {
             Err(run_error) => match result {
                 Ok(()) => Err(crate::UpdatePathsError {
                     source: run_error,
@@ -414,16 +410,48 @@ impl FsEventWatcher {
         self.runloop.is_some()
     }
 
+    // Replace the running stream (if any) with one watching the current path
+    // set. The new stream is started before the old one is stopped, so that a
+    // stream is watching at every moment: events firing inside a stop-then-start
+    // window would be silently dropped for every watched path, not just the one
+    // being (un)watched. An event can be delivered through both streams during
+    // the swap; duplicates are fine, losses are not. Resuming the new stream
+    // from an older event id was tried and made things worse: historical replay
+    // stalls live delivery. If the new stream fails to start, the old one is
+    // kept running so the previous path set keeps delivering events.
+    fn restart(&mut self) -> Result<()> {
+        let old_runloop = self.runloop.take();
+        let result = self.run();
+        match &result {
+            Ok(()) => {
+                if let Some(handle) = old_runloop {
+                    Self::stop_handle(handle);
+                }
+            }
+            Err(_) => {
+                debug_assert!(self.runloop.is_none());
+                self.runloop = old_runloop;
+            }
+        }
+        result
+    }
+
     fn stop(&mut self) {
         if !self.is_running() {
             return;
         }
 
-        if let Some(RunLoopHandle {
+        if let Some(handle) = self.runloop.take() {
+            Self::stop_handle(handle);
+        }
+    }
+
+    fn stop_handle(handle: RunLoopHandle) {
+        let RunLoopHandle {
             runloop,
             stop_source,
             thread_handle,
-        }) = self.runloop.take()
+        } = handle;
         {
             // Calling `CFRunLoopStop` directly here would race: it only takes effect
             // while the runloop is actually running, so a stop landing in the window
