@@ -27,7 +27,6 @@ use std::fmt;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -66,7 +65,6 @@ bitflags::bitflags! {
 pub struct FsEventWatcher {
     paths: cf::CFRetained<cf::CFMutableArray<cf::CFString>>,
     since_when: fs::FSEventStreamEventId,
-    last_event_id: Arc<AtomicU64>,
     latency: cf::CFTimeInterval,
     flags: fs::FSEventStreamCreateFlags,
     event_handler: Arc<Mutex<dyn EventHandler>>,
@@ -319,7 +317,6 @@ struct StreamContextInfo {
     event_handler: Arc<Mutex<dyn EventHandler>>,
     recursive_info: HashMap<PathBuf, WatchInfo>,
     event_kinds: EventKindMask,
-    last_event_id: Arc<AtomicU64>,
 }
 
 // Free the context when the stream created by `FSEventStreamCreate` is released.
@@ -354,7 +351,6 @@ impl FsEventWatcher {
         Ok(FsEventWatcher {
             paths: cf::CFMutableArray::empty(),
             since_when: fs::kFSEventStreamEventIdSinceNow,
-            last_event_id: Arc::new(AtomicU64::new(unsafe { fs::FSEventsGetCurrentEventId() })),
             latency,
             flags: fs::kFSEventStreamCreateFlagFileEvents
                 | fs::kFSEventStreamCreateFlagNoDefer
@@ -367,16 +363,14 @@ impl FsEventWatcher {
     }
 
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        self.stop();
         let result = self.append_path(path, recursive_mode);
-        self.run()?;
+        self.restart()?;
         result
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
-        self.stop();
         let result = self.remove_path(path);
-        self.run()?;
+        self.restart()?;
         result
     }
 
@@ -384,8 +378,6 @@ impl FsEventWatcher {
         &mut self,
         ops: Vec<crate::PathOp>,
     ) -> crate::StdResult<(), crate::UpdatePathsError> {
-        self.stop();
-
         let result = crate::update_paths(ops, |op| match op {
             crate::PathOp::Watch(path, config) => self
                 .append_path(&path, config.recursive_mode())
@@ -395,7 +387,7 @@ impl FsEventWatcher {
                 .map_err(|e| (PathOp::Unwatch(path), e)),
         });
 
-        match self.run() {
+        match self.restart() {
             Err(run_error) => match result {
                 Ok(()) => Err(crate::UpdatePathsError {
                     source: run_error,
@@ -418,16 +410,48 @@ impl FsEventWatcher {
         self.runloop.is_some()
     }
 
+    // Replace the running stream (if any) with one watching the current path
+    // set. The new stream is started before the old one is stopped, so that a
+    // stream is watching at every moment: events firing inside a stop-then-start
+    // window would be silently dropped for every watched path, not just the one
+    // being (un)watched. An event can be delivered through both streams during
+    // the swap; duplicates are fine, losses are not. Resuming the new stream
+    // from an older event id was tried and made things worse: historical replay
+    // stalls live delivery. If the new stream fails to start, the old one is
+    // kept running so the previous path set keeps delivering events.
+    fn restart(&mut self) -> Result<()> {
+        let old_runloop = self.runloop.take();
+        let result = self.run();
+        match &result {
+            Ok(()) => {
+                if let Some(handle) = old_runloop {
+                    Self::stop_handle(handle);
+                }
+            }
+            Err(_) => {
+                debug_assert!(self.runloop.is_none());
+                self.runloop = old_runloop;
+            }
+        }
+        result
+    }
+
     fn stop(&mut self) {
         if !self.is_running() {
             return;
         }
 
-        if let Some(RunLoopHandle {
+        if let Some(handle) = self.runloop.take() {
+            Self::stop_handle(handle);
+        }
+    }
+
+    fn stop_handle(handle: RunLoopHandle) {
+        let RunLoopHandle {
             runloop,
             stop_source,
             thread_handle,
-        }) = self.runloop.take()
+        } = handle;
         {
             // Calling `CFRunLoopStop` directly here would race: it only takes effect
             // while the runloop is actually running, so a stop landing in the window
@@ -441,13 +465,6 @@ impl FsEventWatcher {
             runloop.wake_up();
             // Wait for the thread to shut down.
             thread_handle.join().expect("thread to shut down");
-
-            // The stream is gone; events delivered by the kernel from now until
-            // `run()` starts a replacement stream would otherwise be lost. Resume
-            // the next stream right after the last event this stream delivered, so
-            // the gap is replayed instead of dropped (`translate_flags` already
-            // ignores the HistoryDone sentinel that ends the replay).
-            self.since_when = self.last_event_id.load(Ordering::Acquire);
         }
     }
 
@@ -542,7 +559,6 @@ impl FsEventWatcher {
             event_handler: self.event_handler.clone(),
             recursive_info: self.recursive_info.clone(),
             event_kinds: self.event_kinds,
-            last_event_id: self.last_event_id.clone(),
         }));
 
         let stream_context = fs::FSEventStreamContext {
@@ -722,21 +738,13 @@ unsafe fn callback_impl(
     num_events: libc::size_t,                          // size_t numEvents
     event_paths: NonNull<libc::c_void>,                // void *eventPaths
     event_flags: NonNull<fs::FSEventStreamEventFlags>, // const FSEventStreamEventFlags eventFlags[]
-    event_ids: NonNull<fs::FSEventStreamEventId>,      // const FSEventStreamEventId eventIds[]
+    _event_ids: NonNull<fs::FSEventStreamEventId>,     // const FSEventStreamEventId eventIds[]
 ) {
     let event_paths = event_paths.as_ptr() as *const *const libc::c_char;
     let info = info as *const StreamContextInfo;
     let event_handler_mutex = &(*info).event_handler;
     let event_kinds = (*info).event_kinds;
     let mut event_handler_guard = None;
-
-    // Event ids increase monotonically within a batch, so the last one marks how
-    // far this stream has delivered; `stop()` resumes the next stream from there.
-    if num_events > 0 {
-        (*info)
-            .last_event_id
-            .fetch_max(*event_ids.as_ptr().add(num_events - 1), Ordering::AcqRel);
-    }
 
     for p in 0..num_events {
         // Paths are not guaranteed to be valid UTF-8 (e.g. NFS); keep them as raw bytes.
@@ -1209,7 +1217,6 @@ mod tests {
             event_handler,
             recursive_info,
             event_kinds: EventKindMask::ALL,
-            last_event_id: Arc::new(AtomicU64::new(0)),
         });
         let context_ptr = Box::into_raw(context) as *mut libc::c_void;
 
@@ -1274,7 +1281,6 @@ mod tests {
             event_handler,
             recursive_info,
             event_kinds: EventKindMask::ALL,
-            last_event_id: Arc::new(AtomicU64::new(0)),
         });
         let context_ptr = Box::into_raw(context) as *mut libc::c_void;
 
