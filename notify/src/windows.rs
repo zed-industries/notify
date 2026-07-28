@@ -20,8 +20,8 @@ use std::slice;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ACCESS_DENIED, ERROR_OPERATION_ABORTED, ERROR_SUCCESS, HANDLE,
-    INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_NOTIFY_ENUM_DIR, ERROR_OPERATION_ABORTED,
+    ERROR_SUCCESS, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, ReadDirectoryChangesW, FILE_ACTION_ADDED, FILE_ACTION_MODIFIED,
@@ -37,7 +37,11 @@ use windows_sys::Win32::System::Threading::{
 };
 use windows_sys::Win32::System::IO::{CancelIo, OVERLAPPED};
 
-const BUF_SIZE: u32 = 16384;
+// A 16KB buffer is too small for directories with high churn (e.g. build artifact
+// directories inside large repositories); bursts of changes overflow it easily.
+// 64KB reduces the overflow frequency. Overflows are still handled by the
+// ERROR_NOTIFY_ENUM_DIR / zero-bytes branches in handle_event.
+const BUF_SIZE: u32 = 65536;
 
 #[derive(Clone, Copy)]
 enum SeparatorStyle {
@@ -497,7 +501,7 @@ fn start_read(
 
 unsafe extern "system" fn handle_event(
     error_code: u32,
-    _bytes_written: u32,
+    bytes_written: u32,
     overlapped: *mut OVERLAPPED,
 ) {
     let overlapped: Box<OVERLAPPED> = Box::from_raw(overlapped);
@@ -544,6 +548,34 @@ unsafe extern "system" fn handle_event(
         ERROR_SUCCESS => {
             // Success, continue to handle the event
         }
+        ERROR_NOTIFY_ENUM_DIR => {
+            // The kernel buffer overflowed: the changes accumulated since the last
+            // completion do not fit into the buffer and some events were lost, but
+            // the directory handle is still valid. Re-arm the read and report a
+            // rescan event so consumers can reconcile their state, instead of
+            // silently unwatching the directory and losing the watch forever.
+            log::warn!(
+                "ReadDirectoryChangesW buffer overflow for directory {}; some events were lost, emitting rescan",
+                request.data.dir.display()
+            );
+            if let Err(error) = start_read(
+                &request.data,
+                request.event_handler.clone(),
+                request.event_kinds,
+                request.handle,
+                request.action_tx.clone(),
+            ) {
+                log::error!(
+                    "failed to re-arm ReadDirectoryChangesW after overflow for directory {}: {}",
+                    request.data.dir.display(),
+                    error
+                );
+            }
+            let event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+            emit_event(&request.event_handler, Ok(event));
+            ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+            return;
+        }
         _ => {
             // Some unidentified error occurred, log and unwatch the directory, then return.
             log::error!(
@@ -566,6 +598,22 @@ unsafe extern "system" fn handle_event(
         request.action_tx.clone(),
     )
     .err();
+
+    // On some Windows versions a buffer overflow surfaces as ERROR_SUCCESS with
+    // zero bytes written (rather than ERROR_NOTIFY_ENUM_DIR): the accumulated
+    // changes did not even fit into a single entry. The buffer is all zeros, and
+    // parsing it would silently discard every event. Treat this as an overflow
+    // and report a rescan so consumers can reconcile their state.
+    if error_code == ERROR_SUCCESS && bytes_written == 0 {
+        log::warn!(
+            "ReadDirectoryChangesW reported zero bytes for directory {}; some events were lost, emitting rescan",
+            request.data.dir.display()
+        );
+        let event = Event::new(EventKind::Other).set_flag(Flag::Rescan);
+        emit_event(&request.event_handler, Ok(event));
+        ReleaseSemaphore(request.data.complete_sem, 1, ptr::null_mut());
+        return;
+    }
 
     // The FILE_NOTIFY_INFORMATION struct has a variable length due to the variable length
     // string as its last member. Each struct contains an offset for getting the next entry in
