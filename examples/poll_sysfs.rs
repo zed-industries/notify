@@ -17,11 +17,14 @@ fn not_windows_main() -> notify::Result<()> {
             eprintln!("Must provide path to watch, default system path was not found (probably you're not running on Linux?)");
             std::process::exit(1);
         }
-        println!("Trying {lo_stats:?}, use `ping localhost` to see changes!");
+        println!(
+            "Trying {:?}, use `ping localhost` to see changes!",
+            lo_stats
+        );
         paths.push(lo_stats);
     }
 
-    println!("watching {paths:?}...");
+    println!("watching {:?}...", paths);
     // configure pollwatcher backend
     let config = Config::default()
         .with_compare_contents(true) // crucial part for pseudo filesystems
@@ -36,8 +39,8 @@ fn not_windows_main() -> notify::Result<()> {
     // print all events, never returns
     for res in rx {
         match res {
-            Ok(event) => println!("changed: {event:?}"),
-            Err(e) => println!("watch error: {e:?}"),
+            Ok(event) => println!("changed: {:?}", event),
+            Err(e) => println!("watch error: {:?}", e),
         }
     }
 

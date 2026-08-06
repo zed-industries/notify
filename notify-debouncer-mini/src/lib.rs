@@ -127,7 +127,6 @@ impl Config {
     /// Set timeout
     ///
     /// Timeout is the amount of time after which a debounced event is emitted or a continuous event is send, if there still are events incoming for the specific path.
-    #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
@@ -136,13 +135,11 @@ impl Config {
     ///
     /// When `batch_mode` is enabled, events may be delayed (at most 2x the specified timeout) and delivered with others.
     /// If disabled, all events are delivered immediately when their debounce timeout is reached.
-    #[must_use]
     pub fn with_batch_mode(mut self, batch_mode: bool) -> Self {
         self.batch_mode = batch_mode;
         self
     }
     /// Set [`notify::Config`] for the backend
-    #[must_use]
     pub fn with_notify_config(mut self, notify_config: notify::Config) -> Self {
         self.notify_config = notify_config;
         self

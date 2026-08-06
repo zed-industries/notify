@@ -1,8 +1,10 @@
 use crate::FileIdCache;
 use file_id::{get_file_id, FileId};
 use notify::RecursiveMode;
-use rustc_hash::FxHashMap as HashMap;
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use walkdir::WalkDir;
 
 /// A cache to hold the file system IDs of all watched files.
@@ -16,7 +18,6 @@ pub struct FileIdMap {
 
 impl FileIdMap {
     /// Construct an empty cache.
-    #[must_use]
     pub fn new() -> Self {
         Default::default()
     }

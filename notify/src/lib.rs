@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! notify = "9.0.0-rc.4"
+//! notify = "8.1.0"
 //! ```
 //!
 //! If you want debounced events (or don't need them in-order), see [notify-debouncer-mini](https://docs.rs/notify-debouncer-mini/latest/notify_debouncer_mini/)
@@ -24,7 +24,7 @@
 //! Events are serializable via [serde](https://serde.rs) if the `serde` feature is enabled:
 //!
 //! ```toml
-//! notify = { version = "9.0.0-rc.4", features = ["serde"] }
+//! notify = { version = "8.1.0", features = ["serde"] }
 //! ```
 //!
 //! # Known Problems
@@ -52,8 +52,7 @@
 //!
 //! On APFS, `std::fs::copy` may use copy-on-write cloning (`fclonefileat`/`clonefile`).
 //! This can update inode metadata on the source file, and FSEvents may report a metadata change
-//! for the source path (see [issue #259](https://github.com/notify-rs/notify/issues/259) and
-//! [issue #465](https://github.com/notify-rs/notify/issues/465)).
+//! for the source path (see [issue #259](https://github.com/notify-rs/notify/issues/259)).
 //!
 //! Workarounds are to avoid `std::fs::copy` (use `std::io::copy` or `read`/`write` instead), or
 //! filter out metadata-only events if they're not relevant (e.g. don't include
@@ -173,10 +172,10 @@
 
 #![deny(missing_docs)]
 
-pub use config::{Config, PathOp, RecursiveMode, WatchPathConfig, WindowsPathSeparatorStyle};
+pub use config::{Config, PathOp, RecursiveMode, WatchPathConfig};
 pub use error::{Error, ErrorKind, Result, UpdatePathsError};
 pub use notify_types::event::{self, Event, EventKind, EventKindMask};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 pub(crate) type StdResult<T, E> = std::result::Result<T, E>;
 pub(crate) type Receiver<T> = std::sync::mpsc::Receiver<T>;
@@ -234,7 +233,6 @@ pub mod poll;
 
 mod config;
 mod error;
-mod paths;
 
 #[cfg(test)]
 pub(crate) mod test;
@@ -360,16 +358,6 @@ pub trait Watcher {
     /// If the `path` is a file, `recursive_mode` will be ignored and events will be delivered only
     /// for the file.
     ///
-    /// Event paths are reported using the same root representation as `path`. If `path` is
-    /// relative, emitted event paths are relative to the process current directory at the time this
-    /// method is called. If `path` is absolute, emitted event paths are absolute. Convert `path`
-    /// before calling this method if your application needs a specific representation.
-    ///
-    /// On success, calling this method again for the same backend-resolved path replaces the
-    /// existing watch for that path. The recursive mode is updated to the new value, a second
-    /// independent watch is not added, and a single call to [`Watcher::unwatch`] removes the
-    /// watched path.
-    ///
     /// On some platforms, if the `path` is renamed or removed while being watched, behaviour may
     /// be unexpected. See discussions in [#165] and [#166]. If less surprising behaviour is wanted
     /// one may non-recursively watch the _parent_ directory as well and manage related events.
@@ -442,20 +430,6 @@ pub trait Watcher {
     /// - `Err(notify::Error)` on failure.
     fn configure(&mut self, _option: Config) -> Result<bool> {
         Ok(false)
-    }
-
-    /// Returns the currently watched paths and their recursive modes.
-    ///
-    /// Returned paths use the same representation that was passed to [`Watcher::watch`] or
-    /// [`Watcher::update_paths`].
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the watcher implementation cannot provide this information.
-    fn watched_paths(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
-        Err(Error::generic(
-            "listing watched paths is not supported by this watcher",
-        ))
     }
 
     /// Returns the watcher kind, allowing to perform backend-specific tasks
@@ -540,7 +514,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::{
-        collections::HashSet,
         fs, iter,
         path::{Path, PathBuf},
         sync::mpsc,
@@ -595,84 +568,6 @@ mod tests {
         })
     }
 
-    fn canonical_or_path(path: &Path) -> PathBuf {
-        path.canonicalize()
-            .expect("test paths should always be canonicalizable")
-    }
-
-    fn canonical_watch_set(
-        paths: Vec<(PathBuf, RecursiveMode)>,
-    ) -> HashSet<(PathBuf, RecursiveMode)> {
-        paths
-            .into_iter()
-            .map(|(path, recursive_mode)| (canonical_or_path(&path), recursive_mode))
-            .collect()
-    }
-
-    fn matches_path(path: &Path, expected: &Path, canonical_expected: Option<&PathBuf>) -> bool {
-        path == expected || canonical_expected.is_some_and(|canonical| path == canonical)
-    }
-
-    fn watch_with_retry(
-        watcher: &mut RecommendedWatcher,
-        path: impl AsRef<Path>,
-        recursive_mode: RecursiveMode,
-    ) -> Result<()> {
-        const FSEVENT_WATCH_RETRIES: usize = 5;
-        const FSEVENT_WATCH_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
-
-        let path = path.as_ref();
-        for attempt in 0..=FSEVENT_WATCH_RETRIES {
-            match watcher.watch(path, recursive_mode) {
-                Ok(()) => return Ok(()),
-                Err(err)
-                    if RecommendedWatcher::kind() == WatcherKind::Fsevent
-                        && matches!(
-                            &err.kind,
-                            ErrorKind::Generic(message)
-                                if message == "unable to start FSEvent stream"
-                        )
-                        && attempt < FSEVENT_WATCH_RETRIES =>
-                {
-                    let _ = watcher.unwatch(path);
-                    let delay_factor = 1u32 << attempt;
-                    std::thread::sleep(FSEVENT_WATCH_RETRY_BASE_DELAY * delay_factor);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-
-        unreachable!("watch() retries must return or error")
-    }
-
-    fn update_paths_unwatch_with_retry(
-        watcher: &mut RecommendedWatcher,
-        path: &Path,
-    ) -> Result<()> {
-        const FSEVENT_UNWATCH_RETRIES: usize = 5;
-        const FSEVENT_UNWATCH_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
-
-        for attempt in 0..=FSEVENT_UNWATCH_RETRIES {
-            match watcher.update_paths(vec![PathOp::unwatch(path)]) {
-                Ok(()) => return Ok(()),
-                Err(err)
-                    if RecommendedWatcher::kind() == WatcherKind::Fsevent
-                        && matches!(
-                            &err.source.kind,
-                            ErrorKind::Io(io_err) if io_err.raw_os_error() == Some(9)
-                        )
-                        && attempt < FSEVENT_UNWATCH_RETRIES =>
-                {
-                    let delay_factor = 1u32 << attempt;
-                    std::thread::sleep(FSEVENT_UNWATCH_RETRY_BASE_DELAY * delay_factor);
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
-
-        unreachable!("fsevent unwatch retries must return or error")
-    }
-
     #[test]
     fn integration() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
@@ -680,7 +575,7 @@ mod tests {
         // set up the watcher
         let (tx, rx) = std::sync::mpsc::channel();
         let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-        watch_with_retry(&mut watcher, dir.path(), RecursiveMode::Recursive)?;
+        watcher.watch(dir.path(), RecursiveMode::Recursive)?;
 
         // create a new file
         let file_path = dir.path().join("file.txt");
@@ -700,46 +595,6 @@ mod tests {
         }
 
         panic!("did not receive expected event");
-    }
-
-    #[test]
-    fn event_paths_preserve_relative_watch_root(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let cwd = std::env::current_dir()?;
-        let dir = tempfile::Builder::new()
-            .prefix("notify-relative-")
-            .tempdir_in(&cwd)?;
-        let relative_dir = dir.path().strip_prefix(&cwd)?.to_path_buf();
-        let relative_file = relative_dir.join("file.txt");
-        let absolute_file = dir.path().join("file.txt");
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-        watch_with_retry(&mut watcher, &relative_dir, RecursiveMode::Recursive)?;
-
-        assert!(
-            watcher
-                .watched_paths()?
-                .iter()
-                .any(|(path, mode)| path == &relative_dir && *mode == RecursiveMode::Recursive),
-            "watched_paths() did not preserve relative watch path"
-        );
-
-        fs::write(&absolute_file, b"Lorem ipsum")?;
-
-        for event in iter_with_timeout(&rx) {
-            if event.paths.iter().any(|path| path == &relative_file) {
-                assert!(
-                    event.paths.iter().all(|path| path.is_relative()),
-                    "relative watch emitted absolute path: {event:?}"
-                );
-                return Ok(());
-            }
-
-            println!("unexpected event: {event:?}");
-        }
-
-        panic!("did not receive expected relative event path");
     }
 
     #[test]
@@ -777,53 +632,32 @@ mod tests {
         let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
 
         // start watching a and b
-        const FSEVENT_UPDATE_PATHS_RETRIES: usize = 5;
-        const FSEVENT_UPDATE_PATHS_RETRY_BASE_DELAY: Duration = Duration::from_millis(50);
-        for attempt in 0..=FSEVENT_UPDATE_PATHS_RETRIES {
-            match watcher.update_paths(vec![
-                PathOp::Watch(
-                    dir_a.clone(),
-                    WatchPathConfig::new(RecursiveMode::Recursive),
-                ),
-                PathOp::Watch(
-                    dir_b.clone(),
-                    WatchPathConfig::new(RecursiveMode::Recursive),
-                ),
-            ]) {
-                Ok(()) => break,
-                Err(err)
-                    if RecommendedWatcher::kind() == WatcherKind::Fsevent
-                        && matches!(
-                            &err.source.kind,
-                            ErrorKind::Generic(message)
-                            if message == "unable to start FSEvent stream"
-                        )
-                        && attempt < FSEVENT_UPDATE_PATHS_RETRIES =>
-                {
-                    let delay_factor = 1u32 << attempt;
-                    std::thread::sleep(FSEVENT_UPDATE_PATHS_RETRY_BASE_DELAY * delay_factor);
-                }
-                Err(err) => return Err(err.into()),
-            }
-        }
+        watcher.update_paths(vec![
+            PathOp::Watch(
+                dir_a.clone(),
+                WatchPathConfig::new(RecursiveMode::Recursive),
+            ),
+            PathOp::Watch(
+                dir_b.clone(),
+                WatchPathConfig::new(RecursiveMode::Recursive),
+            ),
+        ])?;
 
         // create file1 in both a and b
         let a_file1 = dir_a.join("file1");
         let b_file1 = dir_b.join("file1");
         fs::write(&a_file1, b"Lorem ipsum")?;
         fs::write(&b_file1, b"Lorem ipsum")?;
-        let a_file1_canonical = a_file1.canonicalize().ok();
-        let b_file1_canonical = b_file1.canonicalize().ok();
 
         // wait for create events of a/file1 and b/file1
         let mut a_file1_encountered: bool = false;
         let mut b_file1_encountered: bool = false;
         for event in iter_with_timeout(&rx) {
             for path in event.paths {
-                a_file1_encountered = a_file1_encountered
-                    || matches_path(&path, &a_file1, a_file1_canonical.as_ref());
-                b_file1_encountered = b_file1_encountered
-                    || matches_path(&path, &b_file1, b_file1_canonical.as_ref());
+                a_file1_encountered =
+                    a_file1_encountered || (path == a_file1 || path == a_file1.canonicalize()?);
+                b_file1_encountered =
+                    b_file1_encountered || (path == b_file1 || path == b_file1.canonicalize()?);
             }
             if a_file1_encountered && b_file1_encountered {
                 break;
@@ -833,163 +667,27 @@ mod tests {
         assert!(b_file1_encountered, "Did not receive event of {b_file1:?}");
 
         // stop watching a
-        update_paths_unwatch_with_retry(&mut watcher, &dir_a)?;
+        watcher.update_paths(vec![PathOp::unwatch(&dir_a)])?;
 
         // create file2 in both a and b
         let a_file2 = dir_a.join("file2");
         let b_file2 = dir_b.join("file2");
         fs::write(&a_file2, b"Lorem ipsum")?;
         fs::write(&b_file2, b"Lorem ipsum")?;
-        let a_file2_canonical = a_file2.canonicalize().ok();
-        let b_file2_canonical = b_file2.canonicalize().ok();
 
         // wait for the create event of b/file2 only
         for event in iter_with_timeout(&rx) {
             for path in event.paths {
                 assert!(
-                    !matches_path(&path, &a_file2, a_file2_canonical.as_ref()),
+                    path != a_file2 || path != a_file2.canonicalize()?,
                     "Event of {a_file2:?} should not be received"
                 );
-                if matches_path(&path, &b_file2, b_file2_canonical.as_ref()) {
+                if path == b_file2 || path == b_file2.canonicalize()? {
                     return Ok(());
                 }
             }
         }
         panic!("Did not receive the event of {b_file2:?}");
-    }
-
-    #[test]
-    fn watched_paths_reflect_watch_and_unwatch(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let dir_a = dir.path().join("a");
-        let dir_b = dir.path().join("b");
-        fs::create_dir(&dir_a)?;
-        fs::create_dir(&dir_b)?;
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-
-        watch_with_retry(&mut watcher, &dir_a, RecursiveMode::Recursive)?;
-        watch_with_retry(&mut watcher, &dir_b, RecursiveMode::NonRecursive)?;
-
-        let watched = canonical_watch_set(watcher.watched_paths()?);
-        assert!(watched.contains(&(canonical_or_path(&dir_a), RecursiveMode::Recursive)));
-        assert!(watched.contains(&(canonical_or_path(&dir_b), RecursiveMode::NonRecursive)));
-
-        watcher.unwatch(&dir_a)?;
-
-        let watched = canonical_watch_set(watcher.watched_paths()?);
-        assert!(!watched.contains(&(canonical_or_path(&dir_a), RecursiveMode::Recursive)));
-        assert!(watched.contains(&(canonical_or_path(&dir_b), RecursiveMode::NonRecursive)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn rewatching_same_path_replaces_recursive_mode(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let root = canonical_or_path(dir.path());
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-
-        watch_with_retry(&mut watcher, dir.path(), RecursiveMode::Recursive)?;
-        watch_with_retry(&mut watcher, dir.path(), RecursiveMode::NonRecursive)?;
-
-        let watched = canonical_watch_set(watcher.watched_paths()?);
-        assert!(watched.contains(&(root.clone(), RecursiveMode::NonRecursive)));
-        assert!(!watched.contains(&(root.clone(), RecursiveMode::Recursive)));
-        assert_eq!(
-            watched.iter().filter(|(path, _mode)| path == &root).count(),
-            1
-        );
-
-        watcher.unwatch(dir.path())?;
-
-        let watched = canonical_watch_set(watcher.watched_paths()?);
-        assert!(!watched.iter().any(|(path, _mode)| path == &root));
-
-        Ok(())
-    }
-
-    #[test]
-    fn overlapping_recursive_watch_preserves_explicit_child(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let dir = tempdir()?;
-        let child = dir.path().join("child");
-        fs::create_dir(&child)?;
-
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-
-        watch_with_retry(&mut watcher, &child, RecursiveMode::NonRecursive)?;
-        watch_with_retry(&mut watcher, dir.path(), RecursiveMode::Recursive)?;
-
-        let watched = canonical_watch_set(watcher.watched_paths()?);
-        assert!(watched.contains(&(canonical_or_path(dir.path()), RecursiveMode::Recursive)));
-        assert!(watched.contains(&(canonical_or_path(&child), RecursiveMode::NonRecursive)));
-
-        watcher.unwatch(dir.path())?;
-
-        let watched = canonical_watch_set(watcher.watched_paths()?);
-        assert!(!watched.contains(&(canonical_or_path(dir.path()), RecursiveMode::Recursive)));
-        assert!(watched.contains(&(canonical_or_path(&child), RecursiveMode::NonRecursive)));
-
-        Ok(())
-    }
-
-    #[test]
-    fn overlapping_recursive_child_rewrites_descendant_event_paths(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
-        let cwd = std::env::current_dir()?;
-        let dir = tempfile::Builder::new()
-            .prefix("notify-overlap-")
-            .tempdir_in(&cwd)?;
-        let relative_dir = dir.path().strip_prefix(&cwd)?.to_path_buf();
-        let child = dir.path().join("child");
-        let grandchild = child.join("grandchild");
-        fs::create_dir_all(&grandchild)?;
-
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut watcher = RecommendedWatcher::new(tx, Config::default())?;
-
-        watch_with_retry(&mut watcher, &relative_dir, RecursiveMode::Recursive)?;
-        watch_with_retry(&mut watcher, &child, RecursiveMode::Recursive)?;
-        watcher.unwatch(&relative_dir)?;
-
-        let watched = watcher.watched_paths()?;
-        assert!(
-            watched
-                .iter()
-                .any(|(path, mode)| path == &child && *mode == RecursiveMode::Recursive),
-            "watched_paths() did not preserve explicit child path: {watched:?}"
-        );
-
-        let file = grandchild.join("file.txt");
-        let stale_file = relative_dir
-            .join("child")
-            .join("grandchild")
-            .join("file.txt");
-        fs::write(&file, b"Lorem ipsum")?;
-
-        for event in iter_with_timeout(&rx) {
-            if event.paths.iter().any(|path| path == &file) {
-                assert!(
-                    event.paths.iter().all(|path| path.is_absolute()),
-                    "absolute child watch emitted non-absolute path: {event:?}"
-                );
-                return Ok(());
-            }
-
-            assert!(
-                !event.paths.iter().any(|path| path == &stale_file),
-                "stale parent-relative file path after parent unwatch: {event:?}"
-            );
-        }
-
-        panic!("did not receive expected child event path");
     }
 
     #[test]
@@ -1021,7 +719,6 @@ mod tests {
         fs::write(&not_existent_file, "")?;
         let waiting_path = existing_dir_2.join("1");
         fs::write(&waiting_path, "")?;
-        let waiting_path_canonical = waiting_path.canonicalize().ok();
 
         for event in iter_with_timeout(&rx) {
             let path = event
@@ -1030,9 +727,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("event must have a path: {event:?}"));
             assert!(
                 path != &not_existent_file,
-                "unexpected {not_existent_file:?} event"
+                "unexpected {:?} event",
+                not_existent_file
             );
-            if matches_path(path, &waiting_path, waiting_path_canonical.as_ref()) {
+            if path == &waiting_path || path == &waiting_path.canonicalize()? {
                 return Ok(());
             }
         }
