@@ -1,22 +1,24 @@
-//! Watcher implementation for the inotify Linux API
+//! Inotify watcher implementation for Linux, Android, and FreeBSD 14.5+.
 //!
 //! The inotify API provides a mechanism for monitoring filesystem events.  Inotify can be used to
 //! monitor individual files, or to monitor directories.  When a directory is monitored, inotify
 //! will return events for the directory itself, and for files inside the directory.
 
 use super::event::*;
-use super::{Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, Watcher};
-use crate::paths::{
-    absolute_path, is_preserved_watch_root, preserved_watch_mode, preserved_watch_roots,
-    recursive_user_watch_ancestor, reported_path, WatchMetadata, WatchPath,
+use super::{
+    Config, Error, ErrorKind, EventHandler, RecursiveMode, Result, WatchPathConfig, Watcher,
 };
-use crate::{bounded, unbounded, BoundSender, Receiver, Sender};
+use crate::paths::{
+    WatchMetadata, WatchPath, absolute_path, is_preserved_watch_root, preserved_watch_mode,
+    preserved_watch_roots, recursive_user_watch_ancestor, reported_path,
+};
+use crate::{BoundSender, Receiver, Sender, bounded, unbounded};
 use inotify as inotify_sys;
 use inotify_sys::{EventMask, Inotify, WatchDescriptor, WatchMask};
 use notify_types::event::EventKindMask;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
-use std::fs::metadata;
+use std::fs::{Metadata, metadata, symlink_metadata};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -25,6 +27,13 @@ use walkdir::WalkDir;
 
 const INOTIFY: mio::Token = mio::Token(0);
 const MESSAGE: mio::Token = mio::Token(1);
+
+/// Flags for a single `inotify_add_watch` call, not event kinds. Never store them in
+/// [`Watch::watch_mask`], which is merged into later adds for the same path.
+const RESOLUTION_FLAGS: WatchMask = WatchMask::DONT_FOLLOW
+    .union(WatchMask::MASK_ADD)
+    .union(WatchMask::MASK_CREATE)
+    .union(WatchMask::ONLYDIR);
 
 /// Convert an EventKindMask to the corresponding inotify WatchMask.
 ///
@@ -101,6 +110,7 @@ struct Watch {
     watch_descriptor: WatchDescriptor,
     watch_mask: WatchMask,
     is_dir: bool,
+    dereference: bool,
     metadata: WatchMetadata,
 }
 
@@ -112,11 +122,20 @@ pub struct INotifyWatcher {
 }
 
 enum EventLoopMsg {
-    AddWatch(WatchPath, RecursiveMode, Sender<Result<()>>),
+    AddWatch(WatchPath, WatchPathConfig, Sender<Result<()>>),
     RemoveWatch(PathBuf, Sender<Result<()>>),
     GetWatchedPaths(Sender<Vec<(PathBuf, RecursiveMode)>>),
     Shutdown,
     Configure(Config, BoundSender<Result<bool>>),
+}
+
+#[inline]
+fn watch_metadata(path: &Path, dereference: bool) -> std::io::Result<Metadata> {
+    if dereference {
+        metadata(path)
+    } else {
+        symlink_metadata(path)
+    }
 }
 
 #[inline]
@@ -140,15 +159,32 @@ fn add_watch_by_event(
     }
 }
 
+/// Queue `path` for removal, if it is watched and `descriptor` still matches its watch.
 #[inline]
-fn remove_watch_by_event(
-    path: &PathBuf,
+fn queue_watch_removal(
+    path: &Path,
+    descriptor: Option<&WatchDescriptor>,
     watches: &HashMap<PathBuf, Watch>,
-    remove_watches: &mut Vec<PathBuf>,
+    remove_watches: &mut BTreeMap<PathBuf, WatchRemoval>,
+    removal: WatchRemoval,
 ) {
-    if watches.contains_key(path) {
-        remove_watches.push(path.to_owned());
+    let watched = watches
+        .get(path)
+        .is_some_and(|watch| descriptor.is_none_or(|wd| &watch.watch_descriptor == wd));
+    if watched {
+        let pending = remove_watches.entry(path.to_owned()).or_insert(removal);
+        *pending = (*pending).max(removal);
     }
+}
+
+/// Variant order is load-bearing: coalescing keeps the greater of two pending removals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum WatchRemoval {
+    /// The watch may still be installed, so remove it from inotify as well as local state.
+    WithOsCall,
+    /// The kernel removed the event's root descriptor, but descendant descriptors may still be
+    /// installed if their filesystem objects survived, for example after being moved elsewhere.
+    DescriptorAlreadyRemoved,
 }
 
 #[inline]
@@ -241,8 +277,8 @@ impl EventLoop {
     fn handle_messages(&mut self) {
         while let Ok(msg) = self.event_loop_rx.try_recv() {
             match msg {
-                EventLoopMsg::AddWatch(path, recursive_mode, tx) => {
-                    let _ = tx.send(self.add_watch(path, recursive_mode.is_recursive(), true));
+                EventLoopMsg::AddWatch(path, config, tx) => {
+                    let _ = tx.send(self.add_watch(path, config, true));
                 }
                 EventLoopMsg::RemoveWatch(path, tx) => {
                     let _ = tx.send(self.remove_watch(path, false));
@@ -287,8 +323,7 @@ impl EventLoop {
 
     fn handle_inotify(&mut self) {
         let mut add_watches = Vec::new();
-        let mut remove_watches = Vec::new();
-        let mut remove_watches_no_syscall = Vec::new();
+        let mut remove_watches = BTreeMap::new();
 
         if let Some(ref mut inotify) = self.inotify {
             let mut buffer = [0; 1024];
@@ -304,6 +339,30 @@ impl EventLoop {
                             if event.mask.contains(EventMask::Q_OVERFLOW) {
                                 let ev = Ok(Event::new(EventKind::Other).set_flag(Flag::Rescan));
                                 self.event_handler.handle_event(ev);
+                            }
+
+                            if event.mask.contains(EventMask::IGNORED) {
+                                // The kernel sends IGNORED whenever it removes a descriptor,
+                                // regardless of the configured mask. A replacement watch may
+                                // already occupy the same pathname, hence the descriptor check.
+                                if let Some(path) = self.paths.get(&event.wd).cloned() {
+                                    if self
+                                        .watches
+                                        .get(&path)
+                                        .is_some_and(|watch| watch.watch_descriptor == event.wd)
+                                    {
+                                        queue_watch_removal(
+                                            &path,
+                                            None,
+                                            &self.watches,
+                                            &mut remove_watches,
+                                            WatchRemoval::DescriptorAlreadyRemoved,
+                                        );
+                                    } else {
+                                        self.paths.remove(&event.wd);
+                                    }
+                                }
+                                continue;
                             }
 
                             let paths = self.paths.get(&event.wd).and_then(|root| {
@@ -332,7 +391,13 @@ impl EventLoop {
                             let mut evs = Vec::new();
 
                             if event.mask.contains(EventMask::MOVED_FROM) {
-                                remove_watch_by_event(&path, &self.watches, &mut remove_watches);
+                                queue_watch_removal(
+                                    &path,
+                                    None,
+                                    &self.watches,
+                                    &mut remove_watches,
+                                    WatchRemoval::WithOsCall,
+                                );
 
                                 let event = Event::new(EventKind::Modify(ModifyKind::Name(
                                     RenameMode::From,
@@ -402,7 +467,13 @@ impl EventLoop {
                                     ))
                                     .add_path(event_path.clone()),
                                 );
-                                remove_watch_by_event(&path, &self.watches, &mut remove_watches);
+                                queue_watch_removal(
+                                    &path,
+                                    None,
+                                    &self.watches,
+                                    &mut remove_watches,
+                                    WatchRemoval::WithOsCall,
+                                );
                             }
                             if event.mask.contains(EventMask::DELETE_SELF) {
                                 let remove_kind = match self.watches.get(&path) {
@@ -414,17 +485,27 @@ impl EventLoop {
                                     Event::new(EventKind::Remove(remove_kind))
                                         .add_path(event_path.clone()),
                                 );
-                                remove_watch_by_event(&path, &self.watches, &mut remove_watches);
+                                // Deleting a watched inode removes its watch in the kernel and
+                                // queues IGNORED, so calling inotify_rm_watch would return EINVAL.
+                                queue_watch_removal(
+                                    &path,
+                                    Some(&event.wd),
+                                    &self.watches,
+                                    &mut remove_watches,
+                                    WatchRemoval::DescriptorAlreadyRemoved,
+                                );
                             }
                             if event.mask.contains(EventMask::UNMOUNT) {
                                 evs.push(unmount_event(event_path.clone()));
                                 // The kernel has already removed this watch descriptor and will
                                 // emit IGNORED; clean up internal state without inotify_rm_watch.
                                 // ref. https://www.man7.org/linux/man-pages/man7/inotify.7.html
-                                remove_watch_by_event(
+                                queue_watch_removal(
                                     &path,
+                                    Some(&event.wd),
                                     &self.watches,
-                                    &mut remove_watches_no_syscall,
+                                    &mut remove_watches,
+                                    WatchRemoval::DescriptorAlreadyRemoved,
                                 );
                             }
                             if event.mask.contains(EventMask::MODIFY) {
@@ -492,20 +573,28 @@ impl EventLoop {
             }
         }
 
-        for path in remove_watches_no_syscall {
-            if let Err(err) = self.remove_watch_without_os_call(path, true) {
-                log::warn!("Unable to remove the path from the watches: {err:?}");
+        // An ancestor sorts before its descendants, so reverse order removes descendants first:
+        // recursive ancestor cleanup then neither repeats syscalls for kernel-removed watches nor
+        // drops the mapping for a live, moved-out descendant.
+        for (path, removal) in remove_watches.into_iter().rev() {
+            if !self.watches.contains_key(&path) {
+                continue;
             }
-        }
 
-        for path in remove_watches {
-            if let Err(err) = self.remove_watch(path, true) {
+            let result = match removal {
+                WatchRemoval::WithOsCall => self.remove_watch(path, true),
+                WatchRemoval::DescriptorAlreadyRemoved => {
+                    self.remove_watch_without_root_os_call(path, true)
+                }
+            };
+            if let Err(err) = result {
                 log::warn!("Unable to remove the path from the watches: {err:?}");
             }
         }
 
         for path in add_watches {
-            if let Err(add_watch_error) = self.add_watch(path, true, false) {
+            let config = WatchPathConfig::new(RecursiveMode::Recursive);
+            if let Err(add_watch_error) = self.add_watch(path, config, false) {
                 // The handler should be notified if we have reached the limit.
                 // Otherwise, the user might expect that a recursive watch
                 // is continuing to work correctly, but it's not.
@@ -521,8 +610,18 @@ impl EventLoop {
         }
     }
 
-    fn add_watch(&mut self, path: WatchPath, is_recursive: bool, watch_self: bool) -> Result<()> {
-        let path_is_dir = metadata(&path.absolute).map_err(Error::io_watch)?.is_dir();
+    fn add_watch(
+        &mut self,
+        path: WatchPath,
+        config: WatchPathConfig,
+        watch_self: bool,
+    ) -> Result<()> {
+        let is_recursive = config.recursive_mode().is_recursive();
+        // a recursive watch has to resolve the path before it can walk it
+        let dereference = config.dereference_symlinks() || is_recursive;
+        let path_is_dir = watch_metadata(&path.absolute, dereference)
+            .map_err(Error::io_watch)?
+            .is_dir();
         let requested_is_recursive = is_recursive && path_is_dir;
         if watch_self {
             if let Some(watch) = self
@@ -532,6 +631,7 @@ impl EventLoop {
             {
                 if watch.metadata.user_is_recursive == requested_is_recursive
                     && watch.metadata.reported_path == path.requested
+                    && watch.dereference == dereference
                 {
                     return Ok(());
                 }
@@ -558,48 +658,70 @@ impl EventLoop {
                     // Removing a directory watch removes its recursively inherited children too.
                     // Re-add them as non-user watches so the ancestor recursive watch still covers
                     // this subtree after the user watch is replaced.
-                    let entries = WalkDir::new(&replaced_path)
-                        .follow_links(self.follow_links)
-                        .into_iter()
-                        .filter_map(filter_dir)
-                        .map(|entry| {
-                            let absolute = entry.into_path();
-                            let requested =
-                                reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
-                            WatchPath::from_parts(absolute, requested)
-                        });
-                    self.add_watches_for_paths(entries, true, false)?;
+                    let entries = recursive_directory_paths(
+                        replaced_path.clone(),
+                        self.follow_links,
+                        self.recursive_walk_barriers(),
+                    )
+                    .map(|entry| {
+                        let absolute = entry;
+                        let requested =
+                            reported_path(&ancestor_path, &ancestor_reported_path, &absolute);
+                        WatchPath::from_parts(absolute, requested)
+                    });
+                    self.add_watches_for_paths(entries, true, true, false)?;
                 }
+            } else if self.watches.get(&path.absolute).is_some_and(|watch| {
+                !dereference && !path_is_dir && watch.is_dir && watch.metadata.is_recursive
+            }) {
+                // A recursive walk already followed this link. Remove its inherited subtree before
+                // replacing the root with an explicit watch on the link itself.
+                self.remove_watch(path.absolute.clone(), false)?;
             }
         }
 
         // If the watch is not recursive, or if we determine (by stat'ing the path to get its
         // metadata) that the watched path is not a directory, add a single path watch.
         if !requested_is_recursive {
-            return self.add_single_watch(path, false, true);
+            return self.add_single_watch(path, false, dereference, true);
         }
 
         let root = path.clone();
-        let entries = WalkDir::new(&root.absolute)
-            .follow_links(self.follow_links)
-            .into_iter()
-            .filter_map(filter_dir)
-            .map(move |entry| root.child(entry.into_path()));
+        let entries = recursive_directory_paths(
+            root.absolute.clone(),
+            self.follow_links,
+            self.recursive_walk_barriers(),
+        )
+        .map(move |entry| root.child(entry));
 
-        self.add_watches_for_paths(entries, is_recursive, watch_self)
+        self.add_watches_for_paths(entries, is_recursive, dereference, watch_self)
+    }
+
+    fn recursive_walk_barriers(&self) -> HashSet<PathBuf> {
+        self.watches
+            .iter()
+            .filter(|(_, watch)| {
+                watch.metadata.is_user_watch && !watch.dereference && !watch.is_dir
+            })
+            .map(|(path, _)| path.clone())
+            .collect()
     }
 
     fn add_watches_for_paths<I>(
         &mut self,
         paths: I,
         is_recursive: bool,
+        dereference: bool,
         mut watch_self: bool,
     ) -> Result<()>
     where
         I: IntoIterator<Item = WatchPath>,
     {
         for path in paths {
-            match self.add_single_watch(path, is_recursive, watch_self) {
+            // entries below the root were reached by following links, so they observe what they
+            // resolved to
+            let entry_dereference = if watch_self { dereference } else { true };
+            match self.add_single_watch(path, is_recursive, entry_dereference, watch_self) {
                 Ok(()) => {}
                 // TOCTOU: a subdirectory can disappear between walkdir listing it and us adding an
                 // inotify watch for it. This should not fail the overall recursive watch call.
@@ -616,6 +738,7 @@ impl EventLoop {
         &mut self,
         path: WatchPath,
         is_recursive: bool,
+        requested_dereference: bool,
         watch_self: bool,
     ) -> Result<()> {
         // Build watch mask from configured event kinds for kernel-level filtering
@@ -627,15 +750,29 @@ impl EventLoop {
         }
 
         let existing_watch = self.watches.get(&path.absolute);
+        // an explicit watch decides for its own path, a walk must not overrule it #255
+        let dereference = if watch_self {
+            requested_dereference
+        } else {
+            existing_watch
+                .filter(|watch| watch.metadata.is_user_watch)
+                .map_or(requested_dereference, |watch| watch.dereference)
+        };
+        let previous_descriptor = existing_watch.map(|watch| watch.watch_descriptor.clone());
+
+        let mut add_mask = watchmask;
         if let Some(watch) = existing_watch {
             watchmask.insert(watch.watch_mask);
-            watchmask.insert(WatchMask::MASK_ADD);
+            add_mask = watchmask | WatchMask::MASK_ADD;
+        }
+        if !dereference {
+            add_mask.insert(WatchMask::DONT_FOLLOW);
         }
 
         if let Some(ref mut inotify) = self.inotify {
             log::trace!("adding inotify watch: {}", path.absolute.display());
 
-            match inotify.watches().add(&path.absolute, watchmask) {
+            match inotify.watches().add(&path.absolute, add_mask) {
                 Err(e) => {
                     Err(if e.raw_os_error() == Some(libc::ENOSPC) {
                         // do not report inotify limits as "no more space" on linux #266
@@ -648,8 +785,8 @@ impl EventLoop {
                     .add_path(path.requested))
                 }
                 Ok(w) => {
-                    watchmask.remove(WatchMask::MASK_ADD);
-                    let is_dir = match metadata(&path.absolute) {
+                    debug_assert!(!watchmask.intersects(RESOLUTION_FLAGS));
+                    let is_dir = match watch_metadata(&path.absolute, dereference) {
                         Ok(metadata) => metadata.is_dir(),
                         Err(e) => {
                             // Avoid leaking an inotify watch if we can't stat after adding it.
@@ -677,12 +814,35 @@ impl EventLoop {
                         }
                     };
 
+                    // re-resolving a path can land on a different inode, so release the old
+                    // descriptor or it keeps reporting under this path
+                    if let Some(previous) = previous_descriptor.filter(|previous| *previous != w) {
+                        // a walk that followed the link shares this descriptor #255
+                        let still_watched = self
+                            .watches
+                            .iter()
+                            .find(|(other, watch)| {
+                                *other != &path.absolute && watch.watch_descriptor == previous
+                            })
+                            .map(|(other, _)| other.clone());
+                        match still_watched {
+                            Some(other) => {
+                                self.paths.insert(previous, other);
+                            }
+                            None => {
+                                self.paths.remove(&previous);
+                                Self::remove_single_descriptor(&mut inotify.watches(), previous);
+                            }
+                        }
+                    }
+
                     self.watches.insert(
                         path.absolute.clone(),
                         Watch {
                             watch_descriptor: w.clone(),
                             watch_mask: watchmask,
                             is_dir,
+                            dereference,
                             metadata,
                         },
                     );
@@ -704,56 +864,82 @@ impl EventLoop {
                 .map(|(path, watch)| (path, &watch.metadata)),
         );
 
-        match self.watches.remove(&path) {
-            None => return Err(Error::watch_not_found().add_path(path)),
-            Some(watch) => {
-                if let Some(ref mut inotify) = self.inotify {
-                    let mut inotify_watches = inotify.watches();
-                    log::trace!("removing inotify watch for {path:?}, remove_recursive: {remove_recursive:?}");
+        let watch = self
+            .watches
+            .remove(&path)
+            .ok_or_else(|| Error::watch_not_found().add_path(path.clone()))?;
+        log::trace!("removing inotify watch for {path:?}, remove_recursive: {remove_recursive:?}");
 
-                    Self::remove_single_descriptor(
-                        &mut inotify_watches,
-                        watch.watch_descriptor.clone(),
-                    );
-                    self.paths.remove(&watch.watch_descriptor);
-
-                    if watch.metadata.is_recursive || remove_recursive {
-                        let mut remove_list = Vec::new();
-                        let mut reset_list = Vec::new();
-                        for (w, p) in &self.paths {
-                            if p.starts_with(&path) {
-                                if let Some(user_is_recursive) =
-                                    preserved_watch_mode(p, &preserved_roots)
-                                {
-                                    if !user_is_recursive
-                                        || is_preserved_watch_root(p, &preserved_roots)
-                                    {
-                                        reset_list.push(p.clone());
-                                    }
-                                    continue;
-                                }
-
-                                Self::remove_single_descriptor(&mut inotify_watches, w.clone());
-                                self.watches.remove(p);
-                                remove_list.push(w.clone());
-                            }
+        let mut removed_descriptors = vec![watch.watch_descriptor];
+        if watch.metadata.is_recursive || remove_recursive {
+            let mut remove_list = Vec::new();
+            let mut reset_list = Vec::new();
+            for candidate in self.watches.keys() {
+                if candidate.starts_with(&path) {
+                    if let Some(user_is_recursive) =
+                        preserved_watch_mode(candidate, &preserved_roots)
+                    {
+                        if !user_is_recursive
+                            || is_preserved_watch_root(candidate, &preserved_roots)
+                        {
+                            reset_list.push(candidate.clone());
                         }
-                        for w in remove_list {
-                            self.paths.remove(&w);
-                        }
-                        for p in reset_list {
-                            if let Some(watch) = self.watches.get_mut(&p) {
-                                watch.metadata.is_recursive = watch.metadata.user_is_recursive;
-                            }
-                        }
+                        continue;
                     }
+
+                    remove_list.push(candidate.clone());
+                }
+            }
+
+            for path in remove_list {
+                if let Some(watch) = self.watches.remove(&path) {
+                    removed_descriptors.push(watch.watch_descriptor);
+                }
+            }
+            for path in reset_list {
+                if let Some(watch) = self.watches.get_mut(&path) {
+                    watch.metadata.is_recursive = watch.metadata.user_is_recursive;
                 }
             }
         }
+
+        self.release_descriptors(removed_descriptors);
         Ok(())
     }
 
-    fn remove_watch_without_os_call(
+    /// Remove descriptors that no remaining logical path uses, and repoint shared descriptors.
+    fn release_descriptors<I>(&mut self, descriptors: I)
+    where
+        I: IntoIterator<Item = WatchDescriptor>,
+    {
+        let descriptors: HashSet<_> = descriptors.into_iter().collect();
+        let mut remaining_owners = HashMap::new();
+        for (path, watch) in &self.watches {
+            if descriptors.contains(&watch.watch_descriptor) {
+                remaining_owners
+                    .entry(watch.watch_descriptor.clone())
+                    .or_insert_with(|| path.clone());
+            }
+        }
+
+        for descriptor in descriptors {
+            if let Some(path) = remaining_owners.remove(&descriptor) {
+                self.paths.insert(descriptor, path);
+                continue;
+            }
+
+            self.paths.remove(&descriptor);
+            if let Some(ref mut inotify) = self.inotify {
+                Self::remove_single_descriptor(&mut inotify.watches(), descriptor);
+            }
+        }
+    }
+
+    /// Remove a root watch after the kernel has already invalidated its descriptor.
+    ///
+    /// Only the root skips `inotify_rm_watch`. Recursive descendants are removed individually
+    /// because their filesystem objects—and therefore their descriptors—may still be live.
+    fn remove_watch_without_root_os_call(
         &mut self,
         path: PathBuf,
         remove_recursive: bool,
@@ -772,6 +958,8 @@ impl EventLoop {
                 self.paths.remove(&watch.watch_descriptor);
 
                 if watch.metadata.is_recursive || remove_recursive {
+                    let mut inotify_watches =
+                        self.inotify.as_mut().map(|inotify| inotify.watches());
                     let mut remove_list = Vec::new();
                     let mut reset_list = Vec::new();
                     for (w, p) in &self.paths {
@@ -787,6 +975,11 @@ impl EventLoop {
                                 continue;
                             }
 
+                            // The kernel removing the root does not prove that this descendant's
+                            // descriptor was removed, for example if it was moved elsewhere.
+                            if let Some(inotify_watches) = inotify_watches.as_mut() {
+                                Self::remove_single_descriptor(inotify_watches, w.clone());
+                            }
                             self.watches.remove(p);
                             remove_list.push(w.clone());
                         }
@@ -802,34 +995,22 @@ impl EventLoop {
                 }
             }
         }
+
         Ok(())
     }
 
-    /// As long as we use the `inotify` crate its behaviour is specified by the documentation of
-    /// a [`inotify::Watches::remove`] method:
-    /// ```text
-    /// Directly returns the error from the call to [inotify_rm_watch].
-    /// Returns an [io::Error] with [ErrorKind]::InvalidInput,
-    /// if the given WatchDescriptor did not originate from this [Inotify] instance.
-    /// ```
+    /// Remove a descriptor while tolerating the deletion race documented by inotify.
     ///
-    /// inotify documentation says, that `inotify_rm_watch` may fail with two specific errors:
-    /// * EBADF - fd is not a valid file descriptor.
-    /// * EINVAL - The watch descriptor wd is not valid or fd is not an inotify file descriptor.
-    ///
-    /// Therefore, we can ignore this errors (and log it), because
-    /// * in the case, when we are removing a watch because of an caught `DELETE` or `DELETE_SELF` event we want the
-    ///   path to be not watched, and in error cases it's already done (unknown file descriptor == it is not watched)
-    /// * in the case, when user is trying to remove the watch, they can do nothing with that kind of an error,
-    ///   it's totally internal. BUT, if there are no "strange" states (like races between user call and internal call,
-    ///   when internal inotify file descriptor has already been invalidated, but the event still hasn't been handled)
-    ///   they will get an [`ErrorKind::WatchNotFound`] error and can deal with it
-    ///
-    /// Log level is info, because it is not a "real" error. Expectedly, it may occurred only by race condition
-    /// (like described above), in other cases it is a bug (but we aren't able to distinguish that states)
+    /// Linux may invalidate a watch before its queued deletion event is handled. In that case
+    /// `inotify_rm_watch` returns EINVAL, but the requested end state has already been reached.
+    /// Other errors indicate an unexpected descriptor or inotify-instance failure and stay visible.
     fn remove_single_descriptor(watches: &mut inotify::Watches, wd: WatchDescriptor) {
         if let Err(err) = watches.remove(wd) {
-            log::info!("unable to remove watch descriptor from inotify: {err:?}");
+            if err.raw_os_error() == Some(libc::EINVAL) {
+                log::trace!("watch descriptor was already removed from inotify: {err:?}");
+            } else {
+                log::warn!("unable to remove watch descriptor from inotify: {err:?}");
+            }
         }
     }
 
@@ -858,6 +1039,19 @@ fn filter_dir(e: walkdir::Result<walkdir::DirEntry>) -> Option<walkdir::DirEntry
     None
 }
 
+fn recursive_directory_paths(
+    root: PathBuf,
+    follow_links: bool,
+    barriers: HashSet<PathBuf>,
+) -> impl Iterator<Item = PathBuf> {
+    WalkDir::new(root)
+        .follow_links(follow_links)
+        .into_iter()
+        .filter_entry(move |entry| !barriers.contains(entry.path()))
+        .filter_map(filter_dir)
+        .map(|entry| entry.into_path())
+}
+
 impl INotifyWatcher {
     fn from_event_handler(event_handler: Box<dyn EventHandler>, config: &Config) -> Result<Self> {
         let inotify = Inotify::init()?;
@@ -868,10 +1062,10 @@ impl INotifyWatcher {
         Ok(INotifyWatcher { channel, waker })
     }
 
-    fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
+    fn watch_inner(&mut self, path: &Path, config: WatchPathConfig) -> Result<()> {
         let pb = WatchPath::new(path)?;
         let (tx, rx) = unbounded();
-        let msg = EventLoopMsg::AddWatch(pb, recursive_mode, tx);
+        let msg = EventLoopMsg::AddWatch(pb, config, tx);
 
         self.channel.send(msg)?;
         self.waker.wake()?;
@@ -903,7 +1097,11 @@ impl Watcher for INotifyWatcher {
     }
 
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        self.watch_inner(path, recursive_mode)
+        self.watch_inner(path, WatchPathConfig::new(recursive_mode))
+    }
+
+    fn watch_with(&mut self, path: &Path, config: WatchPathConfig) -> Result<()> {
+        self.watch_inner(path, config)
     }
 
     fn unwatch(&mut self, path: &Path) -> Result<()> {
@@ -938,7 +1136,7 @@ impl Drop for INotifyWatcher {
 mod tests {
     use std::{
         path::{Path, PathBuf},
-        sync::{atomic::AtomicBool, mpsc, Arc},
+        sync::{Arc, atomic::AtomicBool, mpsc},
         thread::{self, available_parallelism},
         time::Duration,
     };
@@ -946,14 +1144,40 @@ mod tests {
     use super::inotify_sys::WatchMask;
     use super::{
         Config, Error, ErrorKind, Event, EventKind, EventLoop, INotifyWatcher, RecursiveMode,
-        Result, WatchPath, Watcher,
+        Result, WatchPath, WatchPathConfig, Watcher,
     };
     use notify_types::event::{EventKindMask, RemoveKind};
 
     use crate::test::*;
 
+    /// Only data changes, so access events do not disturb exact assertions.
+    fn watcher_with_data_events() -> (TestWatcher<INotifyWatcher>, Receiver) {
+        channel_with_config(
+            ChannelConfig::default().with_watcher_config(
+                Config::default().with_event_kinds(EventKindMask::MODIFY_DATA),
+            ),
+        )
+    }
+
+    fn recursive_watch() -> WatchPathConfig {
+        WatchPathConfig::new(RecursiveMode::Recursive)
+    }
+
+    fn non_recursive_watch() -> WatchPathConfig {
+        WatchPathConfig::new(RecursiveMode::NonRecursive)
+    }
+
     fn watcher() -> (TestWatcher<INotifyWatcher>, Receiver) {
         channel()
+    }
+
+    fn test_event_loop_with_config(config: &Config) -> EventLoop {
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        EventLoop::new(inotify, Box::new(|_| {}), config).unwrap()
+    }
+
+    fn test_event_loop() -> EventLoop {
+        test_event_loop_with_config(&Config::default())
     }
 
     /// Create a watcher configured to receive ALL events including Access events.
@@ -990,6 +1214,32 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn stored_watch_mask_keeps_no_resolution_flags() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let child = root.join("child");
+        std::fs::create_dir(&child).unwrap();
+
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
+            .expect("watch recursively");
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), non_recursive_watch(), true)
+            .expect("rewatch non-recursively");
+
+        for (path, watch) in &event_loop.watches {
+            assert!(
+                !watch.watch_mask.intersects(super::RESOLUTION_FLAGS),
+                "{path:?} stored {:?}",
+                watch.watch_mask
+            );
+        }
+    }
+
     // Regression test for https://github.com/notify-rs/notify/issues/579.
     #[test]
     fn recursive_watch_ignores_missing_subdir_during_initial_scan() {
@@ -1001,8 +1251,7 @@ mod tests {
         fs::create_dir(&disappearing).unwrap();
         fs::remove_dir_all(&disappearing).unwrap();
 
-        let inotify = super::inotify_sys::Inotify::init().unwrap();
-        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+        let mut event_loop = test_event_loop();
 
         // Simulate the TOCTOU: we *intend* to watch a subdirectory discovered during initial scan,
         // but it's already gone by the time we call `inotify_add_watch`.
@@ -1010,6 +1259,7 @@ mod tests {
             [root, disappearing]
                 .into_iter()
                 .map(|path| WatchPath::new(&path).unwrap()),
+            true,
             true,
             true,
         );
@@ -1026,16 +1276,15 @@ mod tests {
         let child = root.join("child");
         std::fs::create_dir(&child).unwrap();
 
-        let inotify = super::inotify_sys::Inotify::init().unwrap();
-        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+        let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
             .expect("watch recursively");
         assert!(event_loop.watches.contains_key(&child));
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), false, true)
+            .add_watch(WatchPath::new(&root).unwrap(), non_recursive_watch(), true)
             .expect("rewatch non-recursively");
 
         let watch = event_loop.watches.get(&root).expect("root watch");
@@ -1053,19 +1302,18 @@ mod tests {
         let grandchild = child.join("grandchild");
         std::fs::create_dir_all(&grandchild).unwrap();
 
-        let inotify = super::inotify_sys::Inotify::init().unwrap();
-        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+        let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
             .expect("watch root recursively");
         event_loop
-            .add_watch(WatchPath::new(&child).unwrap(), false, true)
+            .add_watch(WatchPath::new(&child).unwrap(), non_recursive_watch(), true)
             .expect("watch child non-recursively");
         event_loop
             .add_watch(
                 WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
-                false,
+                non_recursive_watch(),
                 true,
             )
             .expect("rewatch child non-recursively");
@@ -1095,22 +1343,21 @@ mod tests {
         let grandchild = child.join("grandchild");
         std::fs::create_dir_all(&grandchild).unwrap();
 
-        let inotify = super::inotify_sys::Inotify::init().unwrap();
-        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+        let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&root).unwrap(), true, true)
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
             .expect("watch root recursively");
         event_loop
             .remove_watch(child.clone(), false)
             .expect("carve out child");
         event_loop
-            .add_watch(WatchPath::new(&child).unwrap(), false, true)
+            .add_watch(WatchPath::new(&child).unwrap(), non_recursive_watch(), true)
             .expect("watch child non-recursively");
         event_loop
             .add_watch(
                 WatchPath::from_parts(child.clone(), PathBuf::from("reported-child")),
-                false,
+                non_recursive_watch(),
                 true,
             )
             .expect("rewatch child non-recursively");
@@ -1270,6 +1517,122 @@ mod tests {
         );
     }
 
+    // FIXME: FreeBSD 15.1 does not generate IN_IGNORED unless IN_DELETE_SELF was requested.
+    // Remove this ignore once CI uses a release containing the fix:
+    // https://cgit.freebsd.org/src/commit/?id=242c9c86c8cad6aa29bc1af9161d4f0eec45f29b
+    #[cfg_attr(
+        target_os = "freebsd",
+        ignore = "FreeBSD 15.1 does not generate IN_IGNORED unconditionally"
+    )]
+    #[test]
+    fn ignored_event_removes_watch_when_remove_events_are_filtered_out() {
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let root = tmpdir.path().to_path_buf();
+        let child = root.join("child");
+        std::fs::create_dir(&child).expect("create child");
+
+        // Recursive setup still installs a watch for `child`, but the parent does not receive a
+        // DELETE event with this mask. IGNORED is therefore the only cleanup signal and must be
+        // handled independently of the user-visible event filter.
+        let config = Config::default().with_event_kinds(EventKindMask::MODIFY_DATA);
+        let mut event_loop = test_event_loop_with_config(&config);
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
+            .expect("watch recursively");
+
+        let child_descriptor = event_loop
+            .watches
+            .get(&child)
+            .expect("child watch")
+            .watch_descriptor
+            .clone();
+
+        std::fs::remove_dir(&child).expect("remove child");
+        event_loop.handle_inotify();
+
+        assert!(event_loop.watches.contains_key(&root));
+        assert!(
+            !event_loop.watches.contains_key(&child),
+            "IGNORED must remove the stale child watch"
+        );
+        assert!(
+            !event_loop.paths.contains_key(&child_descriptor),
+            "IGNORED must remove the stale descriptor-to-path mapping"
+        );
+    }
+
+    #[test]
+    fn duplicate_watch_removals_are_coalesced() {
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let path = tmpdir.path().to_path_buf();
+        let mut event_loop = test_event_loop();
+        event_loop
+            .add_watch(WatchPath::new(&path).unwrap(), non_recursive_watch(), true)
+            .expect("add_watch");
+
+        // DELETE may queue a normal removal before DELETE_SELF or IGNORED confirms that the
+        // kernel already removed the same descriptor. Keep one entry with the stronger mode.
+        let mut queued = std::collections::BTreeMap::new();
+        for removal in [
+            super::WatchRemoval::WithOsCall,
+            super::WatchRemoval::DescriptorAlreadyRemoved,
+        ] {
+            super::queue_watch_removal(&path, None, &event_loop.watches, &mut queued, removal);
+        }
+
+        assert_eq!(
+            queued.into_iter().collect::<Vec<_>>(),
+            vec![(path, super::WatchRemoval::DescriptorAlreadyRemoved)]
+        );
+    }
+
+    #[test]
+    fn deleting_parent_still_removes_live_moved_out_descendant_descriptor() {
+        let tmpdir = tempfile::tempdir().expect("tmpdir");
+        let root = tmpdir.path().join("root");
+        let child = root.join("child");
+        let moved_child = tmpdir.path().join("moved-child");
+        std::fs::create_dir_all(&child).expect("create watched tree");
+
+        // Excluding rename/remove events deliberately leaves the moved child's old path in the
+        // recursive bookkeeping until deleting the root triggers descriptor cleanup. Unlike the
+        // deleted root descriptor, the descriptor follows the moved child and remains live.
+        let config = Config::default().with_event_kinds(EventKindMask::MODIFY_DATA);
+        let mut event_loop = test_event_loop_with_config(&config);
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
+            .expect("watch recursively");
+
+        let child_descriptor = event_loop
+            .watches
+            .get(&child)
+            .expect("child watch")
+            .watch_descriptor
+            .clone();
+
+        std::fs::rename(&child, &moved_child).expect("move child out of watched root");
+        std::fs::remove_dir(&root).expect("remove watched root");
+        event_loop.handle_inotify();
+
+        assert!(event_loop.watches.is_empty());
+        assert!(event_loop.paths.is_empty());
+
+        // EINVAL here is expected because recursive cleanup should already have issued rm_watch
+        // for the live moved-out descendant. Skipping every syscall for a deleted root would leak
+        // that descriptor even though the local maps looked empty.
+        let remove_result = event_loop
+            .inotify
+            .as_mut()
+            .expect("inotify instance")
+            .watches()
+            .remove(child_descriptor);
+        assert_eq!(
+            remove_result.unwrap_err().raw_os_error(),
+            Some(libc::EINVAL),
+            "the moved-out descendant descriptor must already have been removed"
+        );
+    }
+
     #[test]
     fn unmount_event_maps_to_remove_other_with_unmount_info() {
         let path = PathBuf::from("/tmp/notify-unmount");
@@ -1281,21 +1644,24 @@ mod tests {
     }
 
     #[test]
-    fn remove_watch_without_os_call_removes_internal_state() {
+    fn descriptor_removed_cleanup_removes_internal_state() {
         let tmpdir = tempfile::tempdir().unwrap();
         let watched = tmpdir.path().join("watched");
         std::fs::create_dir(&watched).unwrap();
 
-        let inotify = super::inotify_sys::Inotify::init().unwrap();
-        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+        let mut event_loop = test_event_loop();
 
         event_loop
-            .add_watch(WatchPath::new(&watched).unwrap(), false, true)
+            .add_watch(
+                WatchPath::new(&watched).unwrap(),
+                non_recursive_watch(),
+                true,
+            )
             .expect("add_watch");
 
         event_loop
-            .remove_watch_without_os_call(watched.clone(), true)
-            .expect("remove_watch_without_os_call");
+            .remove_watch_without_root_os_call(watched.clone(), true)
+            .expect("remove_watch_without_root_os_call");
 
         let result = event_loop.remove_watch(watched.clone(), false);
         assert!(
@@ -1693,7 +2059,8 @@ mod tests {
                 break event;
             }
         };
-        assert_eq!(event, expected(&path).modify_data_any());
+        // Linux and FreeBSD classify this modification differently.
+        assert_eq!(event, expected(&path).modify());
     }
 
     #[test]
@@ -1779,7 +2146,9 @@ mod tests {
         ]);
     }
 
+    // FreeBSD reports writes through any hard link to the watched inode.
     #[test]
+    #[cfg(not(target_os = "freebsd"))]
     fn write_to_a_hardlink_pointed_to_the_file_in_the_watched_dir_doesnt_trigger_an_event() {
         let tmpdir = testdir();
         let (mut watcher, mut rx) = watcher();
@@ -2033,5 +2402,215 @@ mod tests {
         // Receives MODIFY from subdir (tracking works), no CREATE events (filtered)
         rx.wait_ordered_exact([expected(&file_path).modify_data()])
             .ensure_no_tail();
+    }
+
+    /// A recursive watch resolves the path it walks, so the flag cannot silence it.
+    #[test]
+    fn recursive_watch_of_a_symlinked_dir_without_dereference_still_walks() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher_with_data_events();
+        let destination = tmpdir.path().join("destination");
+        std::fs::create_dir(&destination).expect("create");
+        let file = destination.join("file");
+        std::fs::write(&file, "").expect("write");
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&destination, &link).expect("symlink");
+
+        watcher
+            .watcher
+            .watch_with(&link, recursive_watch().with_dereference_symlinks(false))
+            .expect("watch link recursively");
+
+        std::fs::write(&file, "123").expect("write");
+
+        rx.wait_ordered([expected(link.join("file")).modify_data_any().multiple()]);
+    }
+
+    // Regression tests for https://github.com/notify-rs/notify/issues/255.
+    #[test]
+    fn watching_a_dangling_symlink_without_dereference() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(tmpdir.path().join("missing"), &link).unwrap();
+
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+                true,
+            )
+            .expect("watch dangling symlink");
+
+        let watch = event_loop.watches.get(&link).expect("link watch");
+        assert!(!watch.is_dir);
+        assert!(!watch.dereference);
+    }
+
+    #[test]
+    fn watching_a_dangling_symlink_with_dereference_is_not_found() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(tmpdir.path().join("missing"), &link).unwrap();
+
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+
+        let result =
+            event_loop.add_watch(WatchPath::new(&link).unwrap(), non_recursive_watch(), true);
+
+        assert!(matches!(
+            result,
+            Err(Error {
+                paths: _,
+                kind: ErrorKind::PathNotFound
+            })
+        ))
+    }
+
+    #[test]
+    fn recursive_watch_of_a_symlink_to_a_file_still_follows_it() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let destination = tmpdir.path().join("destination");
+        let link = tmpdir.path().join("link");
+        std::fs::write(&destination, "").unwrap();
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+
+        event_loop
+            .add_watch(WatchPath::new(&link).unwrap(), recursive_watch(), true)
+            .expect("watch link recursively");
+
+        let watch = event_loop.watches.get(&link).expect("link watch");
+        assert!(watch.dereference);
+        assert!(!watch.watch_mask.intersects(super::RESOLUTION_FLAGS));
+    }
+
+    #[test]
+    fn a_recursive_walk_stops_at_an_explicit_non_dereferenced_link() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = tmpdir.path().to_path_buf();
+        let destination = outside.path().join("destination");
+        let nested = destination.join("nested");
+        let link = root.join("link");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+
+        let inotify = super::inotify_sys::Inotify::init().unwrap();
+        let mut event_loop = EventLoop::new(inotify, Box::new(|_| {}), &Config::default()).unwrap();
+
+        event_loop
+            .add_watch(
+                WatchPath::new(&link).unwrap(),
+                non_recursive_watch().with_dereference_symlinks(false),
+                true,
+            )
+            .expect("watch link");
+        event_loop
+            .add_watch(WatchPath::new(&root).unwrap(), recursive_watch(), true)
+            .expect("watch root recursively");
+
+        let watch = event_loop.watches.get(&link).expect("link watch");
+        assert!(!watch.dereference);
+        assert!(watch.metadata.is_user_watch);
+        assert!(
+            !event_loop.watches.contains_key(&link.join("nested")),
+            "the recursive walk crossed an explicit non-dereferenced link"
+        );
+    }
+
+    #[test]
+    fn watch_with_dereference_disabled_reports_the_link_not_its_destination() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher_with_data_events();
+        let destination = tmpdir.path().join("destination");
+        let link = tmpdir.path().join("link");
+        std::fs::write(&destination, "").expect("write");
+        std::os::unix::fs::symlink(&destination, &link).expect("symlink");
+
+        watcher
+            .watcher
+            .watch_with(
+                &link,
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .expect("watch link");
+        watcher.watch_nonrecursively(&destination);
+
+        std::fs::write(&destination, "123").expect("write");
+
+        rx.wait_ordered_exact([expected(&destination).modify_data_any().multiple()]);
+    }
+
+    /// Taking a watch off a link must not drop an ancestor's coverage of the destination.
+    #[test]
+    fn watching_a_link_itself_keeps_the_ancestors_recursive_coverage() {
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher_with_data_events();
+        let destination = tmpdir.path().join("destination");
+        std::fs::create_dir(&destination).expect("create");
+        let file = destination.join("file");
+        std::fs::write(&file, "").expect("write");
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&destination, &link).expect("symlink");
+
+        watcher.watch_nonrecursively(&link);
+        watcher.watch_recursively(tmpdir.path());
+        watcher
+            .watcher
+            .watch_with(
+                &link,
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .expect("watch the link itself");
+
+        std::fs::write(&file, "123").expect("write");
+
+        let reported: std::collections::HashSet<_> =
+            rx.iter().flat_map(|event| event.paths).collect();
+        assert_eq!(
+            reported,
+            std::collections::HashSet::from([file]),
+            "the ancestor recursive watch must keep reporting the destination by its real path"
+        );
+    }
+
+    /// It does drop it when the link is the only way the tree reaches the destination.
+    #[test]
+    fn watching_a_link_itself_drops_a_destination_reached_only_through_it() {
+        let outside = testdir();
+        let destination = outside.path().join("destination");
+        let nested = destination.join("nested");
+        std::fs::create_dir_all(&nested).expect("create");
+        let file = nested.join("file");
+        std::fs::write(&file, "").expect("write");
+
+        let tmpdir = testdir();
+        let (mut watcher, mut rx) = watcher_with_data_events();
+        let link = tmpdir.path().join("link");
+        std::os::unix::fs::symlink(&destination, &link).expect("symlink");
+
+        watcher.watch_recursively(tmpdir.path());
+        watcher
+            .watcher
+            .watch_with(
+                &link,
+                non_recursive_watch().with_dereference_symlinks(false),
+            )
+            .expect("watch the link itself");
+
+        std::fs::write(&file, "123").expect("write");
+
+        let reported: Vec<_> = rx.iter().flat_map(|event| event.paths).collect();
+        assert!(
+            reported.is_empty(),
+            "the destination is still reported after the caller asked not to follow the link: \
+             {reported:?}"
+        );
     }
 }

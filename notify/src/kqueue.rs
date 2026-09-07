@@ -9,10 +9,10 @@ use super::{
     Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result, Watcher,
 };
 use crate::paths::{
-    absolute_path, is_preserved_watch_root, preserved_watch_mode, preserved_watch_roots,
-    recursive_user_watch_ancestor, reported_path, WatchMetadata as Watch, WatchPath,
+    WatchMetadata as Watch, WatchPath, absolute_path, is_preserved_watch_root,
+    preserved_watch_mode, preserved_watch_roots, recursive_user_watch_ancestor, reported_path,
 };
-use crate::{unbounded, Receiver, Sender};
+use crate::{Receiver, Sender, unbounded};
 use kqueue::{EventData, EventFilter, FilterFlag, Ident};
 use std::collections::HashMap;
 use std::fs::metadata;
@@ -174,6 +174,7 @@ impl EventLoop {
     fn handle_kqueue(&mut self) {
         let mut add_watches = Vec::new();
         let mut remove_watches = Vec::new();
+        let mut pending_events = Vec::new();
 
         while let Some(event) = self.kqueue.poll(None) {
             log::trace!("kqueue event: {event:?}");
@@ -336,7 +337,7 @@ impl EventLoop {
                         Ok(e) if !self.event_kinds.matches(&e.kind) => {
                             // Event filtered out
                         }
-                        _ => self.event_handler.handle_event(event),
+                        _ => pending_events.push(event),
                     }
                 }
                 // as we don't add any other EVFILTER to kqueue we should never get here
@@ -350,6 +351,13 @@ impl EventLoop {
 
         for (path, is_user_watch) in add_watches {
             self.add_watch(path, true, is_user_watch).ok();
+        }
+
+        // Apply recursive watch changes before reporting the events that caused them. Event
+        // handlers may react to a newly created directory immediately; once its create event is
+        // delivered, changes made by that handler must be covered by the new directory watch.
+        for event in pending_events {
+            self.event_handler.handle_event(event);
         }
     }
 
@@ -576,9 +584,7 @@ impl KqueueWatcher {
         self.waker
             .wake()
             .map_err(|e| Error::generic(&e.to_string()))?;
-        rx.recv()
-            .unwrap()
-            .map_err(|e| Error::generic(&e.to_string()))
+        rx.recv().map_err(|e| Error::generic(&e.to_string()))?
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
@@ -592,9 +598,7 @@ impl KqueueWatcher {
         self.waker
             .wake()
             .map_err(|e| Error::generic(&e.to_string()))?;
-        rx.recv()
-            .unwrap()
-            .map_err(|e| Error::generic(&e.to_string()))
+        rx.recv().map_err(|e| Error::generic(&e.to_string()))?
     }
 
     fn watched_paths_inner(&self) -> Result<Vec<(PathBuf, RecursiveMode)>> {
@@ -651,6 +655,16 @@ mod tests {
         channel()
     }
 
+    fn test_event_loop() -> std::result::Result<EventLoop, Box<dyn std::error::Error>> {
+        let kqueue = kqueue::Watcher::new()?;
+        Ok(EventLoop::new(
+            kqueue,
+            Box::new(|_| {}),
+            false,
+            EventKindMask::ALL,
+        )?)
+    }
+
     #[test]
     fn test_remove_recursive() -> std::result::Result<(), Box<dyn std::error::Error>> {
         let path = PathBuf::from("src");
@@ -667,14 +681,55 @@ mod tests {
     }
 
     #[test]
-    fn internal_recursive_refresh_preserves_explicit_child(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn recursive_watch_is_installed_before_directory_create_event_is_delivered() {
+        let tmpdir = testdir();
+        let root = tmpdir.path();
+        let child = root.join("child");
+        let file = child.join("created-from-handler.txt");
+
+        let callback_child = child.clone();
+        let callback_file = file.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut watcher = KqueueWatcher::new(
+            move |event: Result<Event>| {
+                if event.as_ref().is_ok_and(|event| {
+                    matches!(event.kind, EventKind::Create(CreateKind::Folder))
+                        && event.paths.contains(&callback_child)
+                }) {
+                    std::fs::write(&callback_file, "created by event handler")
+                        .expect("create file from directory-create event handler");
+                }
+                let _ = tx.send(event);
+            },
+            Config::default(),
+        )
+        .expect("create watcher");
+        watcher
+            .watch(root, RecursiveMode::Recursive)
+            .expect("watch recursively");
+
+        std::fs::create_dir(&child).expect("create child directory");
+
+        let mut rx = test::Receiver {
+            rx,
+            timeout: Duration::from_secs(5),
+            detect_changes: None,
+            kind: crate::WatcherKind::Kqueue,
+        };
+        rx.wait_unordered([
+            expected(&child).create_folder(),
+            expected(&file).create_file(),
+        ]);
+    }
+
+    #[test]
+    fn internal_recursive_refresh_preserves_explicit_child()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let child = dir.path().join("child");
         std::fs::create_dir(&child)?;
 
-        let kqueue = kqueue::Watcher::new()?;
-        let mut event_loop = EventLoop::new(kqueue, Box::new(|_| {}), false, EventKindMask::ALL)?;
+        let mut event_loop = test_event_loop()?;
 
         event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
         event_loop.add_watch(WatchPath::new(&child)?, false, true)?;
@@ -709,8 +764,7 @@ mod tests {
         let child = dir.path().join("child");
         std::fs::write(&child, "")?;
 
-        let kqueue = kqueue::Watcher::new()?;
-        let mut event_loop = EventLoop::new(kqueue, Box::new(|_| {}), false, EventKindMask::ALL)?;
+        let mut event_loop = test_event_loop()?;
 
         event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
         assert!(event_loop.watches.contains_key(&child));
@@ -724,14 +778,13 @@ mod tests {
     }
 
     #[test]
-    fn rewatching_same_path_replaces_recursive_state(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn rewatching_same_path_replaces_recursive_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let child = dir.path().join("child");
         std::fs::create_dir(&child)?;
 
-        let kqueue = kqueue::Watcher::new()?;
-        let mut event_loop = EventLoop::new(kqueue, Box::new(|_| {}), false, EventKindMask::ALL)?;
+        let mut event_loop = test_event_loop()?;
 
         event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
         assert!(event_loop.watches.contains_key(&child));
@@ -748,15 +801,14 @@ mod tests {
     }
 
     #[test]
-    fn rewatching_child_preserves_recursive_parent_state(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn rewatching_child_preserves_recursive_parent_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let child = dir.path().join("child");
         let grandchild = child.join("grandchild");
         std::fs::create_dir_all(&grandchild)?;
 
-        let kqueue = kqueue::Watcher::new()?;
-        let mut event_loop = EventLoop::new(kqueue, Box::new(|_| {}), false, EventKindMask::ALL)?;
+        let mut event_loop = test_event_loop()?;
 
         event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
         event_loop.add_watch(WatchPath::new(&child)?, false, true)?;
@@ -783,15 +835,14 @@ mod tests {
     }
 
     #[test]
-    fn rewatching_carved_out_child_does_not_restore_parent_recursive_state(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn rewatching_carved_out_child_does_not_restore_parent_recursive_state()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir()?;
         let child = dir.path().join("child");
         let grandchild = child.join("grandchild");
         std::fs::create_dir_all(&grandchild)?;
 
-        let kqueue = kqueue::Watcher::new()?;
-        let mut event_loop = EventLoop::new(kqueue, Box::new(|_| {}), false, EventKindMask::ALL)?;
+        let mut event_loop = test_event_loop()?;
 
         event_loop.add_watch(WatchPath::new(dir.path())?, true, true)?;
         event_loop.remove_watch(child.clone(), false)?;

@@ -4,15 +4,16 @@
 //! Rust stdlib APIs and should work on all of the platforms it supports.
 
 use crate::{
-    paths::{absolute_path, WatchPath},
-    unbounded, Config, Error, EventHandler, Receiver, RecursiveMode, Sender, Watcher,
+    Config, Error, EventHandler, Receiver, RecursiveMode, Sender, Watcher,
+    paths::{WatchPath, absolute_path},
+    unbounded,
 };
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     thread,
     time::Duration,
@@ -71,9 +72,9 @@ impl ScanEventHandler for () {
 use data::{DataBuilder, WatchData};
 mod data {
     use crate::{
-        event::{CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind, RemoveKind},
-        paths::{reported_path, WatchPath},
         EventHandler, RecursiveMode,
+        event::{CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind, RemoveKind},
+        paths::{WatchPath, reported_path},
     };
     use notify_types::event::EventKindMask;
     use std::{
@@ -90,10 +91,12 @@ mod data {
 
     use super::ScanEventHandler;
 
-    fn system_time_to_seconds(time: std::time::SystemTime) -> i64 {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+
+    fn system_time_to_nanos(time: std::time::SystemTime) -> i128 {
         match time.duration_since(std::time::SystemTime::UNIX_EPOCH) {
-            Ok(d) => d.as_secs() as i64,
-            Err(e) => -(e.duration().as_secs() as i64),
+            Ok(d) => d.as_nanos() as i128,
+            Err(e) => -(e.duration().as_nanos() as i128),
         }
     }
 
@@ -362,11 +365,7 @@ mod data {
         }
 
         fn dir_scan_depth(is_recursive: bool) -> usize {
-            if is_recursive {
-                usize::MAX
-            } else {
-                1
-            }
+            if is_recursive { usize::MAX } else { 1 }
         }
 
         pub(super) fn recursive_mode(&self) -> RecursiveMode {
@@ -387,8 +386,8 @@ mod data {
     /// See [`WatchData`] for more detail.
     #[derive(Debug, Clone)]
     struct PathData {
-        /// File updated time.
-        mtime: i64,
+        /// File updated time in nanoseconds since the Unix epoch.
+        mtime: i128,
 
         /// Content's hash value, only available if user request compare file
         /// contents and read successful.
@@ -402,10 +401,19 @@ mod data {
         /// Create a new `PathData`.
         fn new(data_builder: &DataBuilder, meta_path: &MetaPath) -> PathData {
             let metadata = meta_path.metadata();
+            let is_file = metadata.is_file();
+            let mut mtime = metadata.modified().map_or(0, system_time_to_nanos);
+            if !is_file || data_builder.compare_contents {
+                // Child changes update directory mtimes. Preserve the existing second precision for
+                // directories to avoid emitting a redundant directory event for every file event.
+                // Hashed watchers also retain second precision so content changes keep their
+                // existing event classification.
+                mtime = mtime / NANOS_PER_SECOND * NANOS_PER_SECOND;
+            }
 
             PathData {
-                mtime: metadata.modified().map_or(0, system_time_to_seconds),
-                hash: if data_builder.compare_contents && metadata.is_file() {
+                mtime,
+                hash: if data_builder.compare_contents && is_file {
                     content_hash(meta_path.path()).ok()
                 } else {
                     None
@@ -767,16 +775,85 @@ impl Drop for PollWatcher {
 #[cfg(test)]
 mod tests {
     use super::PollWatcher;
-    use crate::{test::*, Config, RecursiveMode, Watcher};
+    use crate::{Config, RecursiveMode, Watcher, test::*};
 
     fn watcher() -> (TestWatcher<PollWatcher>, Receiver) {
         poll_watcher_channel()
+    }
+
+    /// Dates a path's write time an hour ahead. `PathData::mtime` has whole-second resolution
+    /// and is compared before the content hash, so a change to an entry is reported as
+    /// `Metadata(WriteTime)` unless its recorded write time is one that nothing happening
+    /// afterwards can exceed.
+    fn set_write_time_ahead(path: &std::path::Path) {
+        let ahead = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open to set write time")
+            .set_modified(ahead)
+            .expect("set write time");
     }
 
     #[test]
     fn poll_watcher_is_send_and_sync() {
         fn check<T: Send + Sync>() {}
         check::<PollWatcher>();
+    }
+
+    #[test]
+    fn detects_subsecond_mtime_change_without_content_hashing() {
+        use std::{
+            fs,
+            sync::mpsc,
+            time::{Duration, SystemTime},
+        };
+
+        use crate::event::{EventKind, MetadataKind, ModifyKind};
+
+        let tmpdir = testdir();
+        let path = tmpdir.path().join("entry");
+        fs::write(&path, "initial").expect("write initial contents");
+
+        let current_second = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("current time must be after the Unix epoch")
+            .as_secs();
+        let initial_mtime = SystemTime::UNIX_EPOCH
+            + Duration::from_secs(current_second)
+            + Duration::from_millis(100);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open file to set initial mtime")
+            .set_modified(initial_mtime)
+            .expect("set initial mtime");
+
+        let (tx, rx) = mpsc::channel();
+        let mut watcher =
+            PollWatcher::new(tx, Config::default().with_manual_polling()).expect("create watcher");
+        watcher
+            .watch(tmpdir.path(), RecursiveMode::Recursive)
+            .expect("watch directory");
+
+        fs::write(&path, "updated").expect("write updated contents");
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("open file to set updated mtime")
+            .set_modified(initial_mtime + Duration::from_millis(100))
+            .expect("set updated mtime");
+        watcher.poll().expect("poll for changes");
+
+        let event = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive subsecond mtime change")
+            .expect("watch event must not be an error");
+        assert_eq!(event.paths, vec![path]);
+        assert_eq!(
+            event.kind,
+            EventKind::Modify(ModifyKind::Metadata(MetadataKind::WriteTime))
+        );
     }
 
     #[test]
@@ -879,7 +956,10 @@ mod tests {
         rx.sleep_until_exists(&path);
         rx.sleep_until_walkdir_returns_set(tmpdir.path(), [&path]);
 
-        rx.wait_ordered_exact([expected(&path).create_any()]);
+        rx.wait_unordered_exact([
+            expected(&path).create_any(),
+            expected(tmpdir.path()).modify_meta_mtime().optional(),
+        ]);
     }
 
     #[test]
@@ -895,7 +975,10 @@ mod tests {
         rx.sleep_until_exists(&path);
         rx.sleep_until_walkdir_returns_set(tmpdir.path(), [&path]);
 
-        rx.wait_ordered_exact([expected(&path).create_any()]);
+        rx.wait_unordered_exact([
+            expected(&path).create_any(),
+            expected(tmpdir.path()).modify_meta_mtime().optional(),
+        ]);
     }
 
     #[test]
@@ -909,7 +992,9 @@ mod tests {
         rx.sleep_until_exists(&path);
         rx.sleep_until_walkdir_returns_set(tmpdir.path(), [&path]);
 
+        set_write_time_ahead(&path);
         watcher.watch_recursively(&tmpdir);
+
         std::fs::write(&path, b"123").expect("Unable to write");
 
         assert!(
@@ -938,7 +1023,10 @@ mod tests {
         rx.sleep_while_parent_contains(&path);
         rx.sleep_until_walkdir_returns_set::<&str>(tmpdir.path(), []);
 
-        rx.wait_ordered_exact([expected(&path).remove_any()]);
+        rx.wait_unordered_exact([
+            expected(&path).remove_any(),
+            expected(tmpdir.path()).modify_meta_mtime().optional(),
+        ]);
     }
 
     #[test]
@@ -968,6 +1056,7 @@ mod tests {
         rx.wait_unordered_exact([
             expected(&path).remove_any(),
             expected(&new_path).create_any(),
+            expected(tmpdir.path()).modify_meta_mtime().optional(),
         ]);
     }
 
@@ -982,6 +1071,8 @@ mod tests {
         rx.sleep_until_parent_contains(&overwritten_file);
         rx.sleep_until_exists(&overwritten_file);
         rx.sleep_until_walkdir_returns_set(tmpdir.path(), [overwritten_file.clone()]);
+
+        set_write_time_ahead(&overwritten_file);
 
         watcher.watch_nonrecursively(&tmpdir);
 
