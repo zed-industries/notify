@@ -2,15 +2,29 @@
 
 ## unreleased
 
+## notify 9.0.0-rc.5 (2026-08-30)
+
+- CHANGE: update to edition 2024
+- FEATURE: [FreeBSD] select native inotify automatically when building on FreeBSD 14.5+ and kqueue otherwise. The `freebsd_inotify` feature enables inotify when cross-compiling for FreeBSD 14.5+.
+- DEPS: bump `inotify` to 0.11.4 for native FreeBSD support
 - FEATURE: [macOS] add `Config::with_fsevent_latency` to configure FSEvents stream latency [#930]
+- FIX: [linux] coalesce duplicate inotify cleanup events and handle kernel-removed descriptors without spurious `EINVAL` or `WatchNotFound` logs
 - FIX: [windows] emit a Remove event when a watched directory is deleted, matching inotify and FSEvents
 - FIX: [windows] surface `ReadDirectoryChangesW` read-start failures [#935]
+- FIX: [windows] prevent watch shutdown and watched-directory deletion races from emitting spurious I/O errors [#958]
+- FIX: [windows] emit a rescan event when `ReadDirectoryChangesW` discards change details [#964]
 - FEATURE: [windows] report created file/folder kinds when they can be determined [#935]
 - CHANGE: [macOS] improve FSEvents callback performance by avoiding unnecessary allocations and repeated handler locking
+- FIX: [macOS] refuse to create FSEvents streams whose combined path count would make macOS close a file descriptor this process owns
+- CHANGE: [macOS] pass a single FSEvents stream root for watches nested inside another recursive watch on the same volume; a coalesced watch no longer reports a separate root-changed event when it or one of its ancestors is renamed
 - PERF: [kqueue] avoid filesystem walks for recursive kqueue unwatch
+- FEATURE: add `Watcher::watch_with` to pass per-path settings, and `WatchPathConfig::with_dereference_symlinks` to watch a symbolic link itself instead of its destination, which also makes a dangling link watchable [#255]
+- FIX: [poll] detect subsecond file mtime changes without content hashing
 
+[#255]: https://github.com/notify-rs/notify/issues/255
 [#930]: https://github.com/notify-rs/notify/pull/930
 [#935]: https://github.com/notify-rs/notify/issues/935
+[#958]: https://github.com/notify-rs/notify/pull/958
 
 ## notify 9.0.0-rc.4 (2026-05-02)
 

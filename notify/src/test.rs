@@ -141,7 +141,7 @@ impl Receiver {
     ///
     /// It doesn't fail on timeout, instead it returns None
     ///
-    /// This behaviour is better for tests, because allows us to determine which events was received
+    /// This behaviour is better for tests, because it allows us to determine which events were received
     pub fn iter(&mut self) -> impl Iterator<Item = Event> + '_ {
         struct Iter<'a> {
             rx: &'a mut Receiver,
@@ -646,8 +646,10 @@ mod expect {
     pub struct Unordered(Vec<(usize, ExpectedEvent)>);
 
     impl ExpectedEvents for Unordered {
+        // A queue holding nothing but optional expectations must not keep the waiter blocking
+        // on an event that may never arrive.
         fn is_empty(&self) -> bool {
-            self.0.is_empty()
+            self.0.iter().all(|(_, expected)| expected.is_optional())
         }
 
         fn expected(&mut self, event: &Event) -> Option<ExpectedEvent> {
@@ -673,7 +675,7 @@ mod expect {
 
     impl ExpectedEvents for Ordered {
         fn is_empty(&self) -> bool {
-            self.0.is_empty()
+            self.0.iter().all(|expected| expected.is_optional())
         }
 
         fn expected(&mut self, event: &Event) -> Option<ExpectedEvent> {

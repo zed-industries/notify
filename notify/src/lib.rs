@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! notify = "9.0.0-rc.4"
+//! notify = "9.0.0-rc.5"
 //! ```
 //!
 //! If you want debounced events (or don't need them in-order), see [notify-debouncer-mini](https://docs.rs/notify-debouncer-mini/latest/notify_debouncer_mini/)
@@ -15,16 +15,21 @@
 //! List of compilation features, see below for details
 //!
 //! - `serde` for serialization of events
-//! - `macos_fsevent` enabled by default, for fsevent backend on macos
-//! - `macos_kqueue` for kqueue backend on macos
+//! - `macos_fsevent` (default) for the FSEvents backend on macOS
+//! - `macos_kqueue` for the kqueue backend on macOS
+//! - `freebsd_inotify` enables notify's inotify backend on FreeBSD 14.5+
+//!   - inotify is automatically enabled when built natively, this feature is only needed for cross-compilation
 //! - `serialization-compat-6` restores the serialization behavior of notify 6, off by default
+//!
+//! Native FreeBSD builds use inotify on 14.5+ and kqueue on older releases. When
+//! cross-compiling for FreeBSD 14.5+, enable `freebsd_inotify` explicitly.
 //!
 //! ### Serde
 //!
 //! Events are serializable via [serde](https://serde.rs) if the `serde` feature is enabled:
 //!
 //! ```toml
-//! notify = { version = "9.0.0-rc.4", features = ["serde"] }
+//! notify = { version = "9.0.0-rc.5", features = ["serde"] }
 //! ```
 //!
 //! # Known Problems
@@ -181,7 +186,12 @@ use std::path::{Path, PathBuf};
 pub(crate) type StdResult<T, E> = std::result::Result<T, E>;
 pub(crate) type Receiver<T> = std::sync::mpsc::Receiver<T>;
 pub(crate) type Sender<T> = std::sync::mpsc::Sender<T>;
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "freebsd", notify_freebsd_inotify),
+    target_os = "windows",
+))]
 pub(crate) type BoundSender<T> = std::sync::mpsc::SyncSender<T>;
 
 #[inline]
@@ -189,7 +199,12 @@ pub(crate) fn unbounded<T>() -> (Sender<T>, Receiver<T>) {
     std::sync::mpsc::channel()
 }
 
-#[cfg(any(target_os = "linux", target_os = "android", target_os = "windows"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "freebsd", notify_freebsd_inotify),
+    target_os = "windows",
+))]
 #[inline]
 pub(crate) fn bounded<T>(cap: usize) -> (BoundSender<T>, Receiver<T>) {
     std::sync::mpsc::sync_channel(cap)
@@ -197,7 +212,11 @@ pub(crate) fn bounded<T>(cap: usize) -> (BoundSender<T>, Receiver<T>) {
 
 #[cfg(all(target_os = "macos", not(feature = "macos_kqueue")))]
 pub use crate::fsevent::FsEventWatcher;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "freebsd", notify_freebsd_inotify),
+))]
 pub use crate::inotify::INotifyWatcher;
 #[cfg(any(
     target_os = "freebsd",
@@ -215,7 +234,11 @@ pub use windows::ReadDirectoryChangesWatcher;
 
 #[cfg(all(target_os = "macos", not(feature = "macos_kqueue")))]
 pub mod fsevent;
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "freebsd", notify_freebsd_inotify),
+))]
 pub mod inotify;
 #[cfg(any(
     target_os = "freebsd",
@@ -309,7 +332,7 @@ impl EventHandler for std::sync::mpsc::Sender<Result<Event>> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum WatcherKind {
-    /// inotify backend (linux)
+    /// Inotify backend (Linux, Android, and FreeBSD 14.5+)
     Inotify,
     /// FS-Event backend (mac)
     Fsevent,
@@ -378,6 +401,19 @@ pub trait Watcher {
     /// [#166]: https://github.com/notify-rs/notify/issues/166
     fn watch(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()>;
 
+    /// Begin watching a path with per-path settings.
+    ///
+    /// Behaves like [`Watcher::watch`], with the options in `config` applied to this watch alone.
+    /// Backends that do not implement a given option ignore it, so the default implementation
+    /// applies only [`WatchPathConfig::recursive_mode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error in the case that `path` does not exist or if adding the watch fails.
+    fn watch_with(&mut self, path: &Path, config: WatchPathConfig) -> Result<()> {
+        self.watch(path, config.recursive_mode())
+    }
+
     /// Stop watching a path.
     ///
     /// # Errors
@@ -425,7 +461,7 @@ pub trait Watcher {
     fn update_paths(&mut self, ops: Vec<PathOp>) -> StdResult<(), UpdatePathsError> {
         update_paths(ops, |op| match op {
             PathOp::Watch(path, config) => self
-                .watch(&path, config.recursive_mode())
+                .watch_with(&path, config.clone())
                 .map_err(|e| (PathOp::Watch(path, config), e)),
             PathOp::Unwatch(path) => self.unwatch(&path).map_err(|e| (PathOp::Unwatch(path), e)),
         })
@@ -465,7 +501,11 @@ pub trait Watcher {
 }
 
 /// The recommended [`Watcher`] implementation for the current platform
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "android",
+    all(target_os = "freebsd", notify_freebsd_inotify),
+))]
 pub type RecommendedWatcher = INotifyWatcher;
 /// The recommended [`Watcher`] implementation for the current platform
 #[cfg(all(target_os = "macos", not(feature = "macos_kqueue")))]
@@ -475,7 +515,7 @@ pub type RecommendedWatcher = FsEventWatcher;
 pub type RecommendedWatcher = ReadDirectoryChangesWatcher;
 /// The recommended [`Watcher`] implementation for the current platform
 #[cfg(any(
-    target_os = "freebsd",
+    all(target_os = "freebsd", not(notify_freebsd_inotify)),
     target_os = "openbsd",
     target_os = "netbsd",
     target_os = "dragonfly",
@@ -577,7 +617,56 @@ mod tests {
         assert_debug_impl!(PollWatcher);
         assert_debug_impl!(RecommendedWatcher);
         assert_debug_impl!(RecursiveMode);
+        assert_debug_impl!(WatchPathConfig);
         assert_debug_impl!(WatcherKind);
+    }
+
+    include!("freebsd_version.rs");
+
+    fn freebsd_inotify_supported(output: &str) -> bool {
+        parse_freebsd_release(output).is_some_and(|release| release >= FREEBSD_INOTIFY_MIN)
+    }
+
+    #[test]
+    fn freebsd_inotify_release_threshold() {
+        for (version, expected) in [
+            ("13.5-RELEASE", false),
+            ("14.4-RELEASE", false),
+            ("14.4-RELEASE-p3", false),
+            ("14.4-STABLE", false),
+            ("14.5-BETA1", true),
+            ("14.5-RELEASE", true),
+            ("14.5-RELEASE-p1", true),
+            ("14.5-STABLE", true),
+            ("14.6-RELEASE", true),
+            ("15.0-RELEASE", true),
+            ("15.1-RELEASE", true),
+            ("16.0-CURRENT", true),
+        ] {
+            assert_eq!(freebsd_inotify_supported(version), expected, "{version}");
+        }
+        assert_eq!(parse_freebsd_release(""), None);
+        assert_eq!(parse_freebsd_release("14"), None);
+        assert_eq!(parse_freebsd_release("14."), None);
+    }
+
+    #[cfg(target_os = "freebsd")]
+    #[test]
+    fn recommended_watcher_matches_freebsd_version() {
+        let output = std::process::Command::new("/bin/freebsd-version")
+            .arg("-u")
+            .output()
+            .expect("run freebsd-version");
+        assert!(output.status.success(), "freebsd-version failed");
+
+        let version = std::str::from_utf8(&output.stdout).expect("parse freebsd-version output");
+        let expected = if cfg!(feature = "freebsd_inotify") || freebsd_inotify_supported(version) {
+            WatcherKind::Inotify
+        } else {
+            WatcherKind::Kqueue
+        };
+
+        assert_eq!(RecommendedWatcher::kind(), expected);
     }
 
     fn iter_with_timeout(rx: &mpsc::Receiver<Result<Event>>) -> impl Iterator<Item = Event> + '_ {
@@ -703,8 +792,8 @@ mod tests {
     }
 
     #[test]
-    fn event_paths_preserve_relative_watch_root(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn event_paths_preserve_relative_watch_root()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let cwd = std::env::current_dir()?;
         let dir = tempfile::Builder::new()
             .prefix("notify-relative-")
@@ -859,8 +948,8 @@ mod tests {
     }
 
     #[test]
-    fn watched_paths_reflect_watch_and_unwatch(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn watched_paths_reflect_watch_and_unwatch()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let dir_a = dir.path().join("a");
         let dir_b = dir.path().join("b");
@@ -887,8 +976,8 @@ mod tests {
     }
 
     #[test]
-    fn rewatching_same_path_replaces_recursive_mode(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn rewatching_same_path_replaces_recursive_mode()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let root = canonical_or_path(dir.path());
 
@@ -915,8 +1004,8 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_recursive_watch_preserves_explicit_child(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn overlapping_recursive_watch_preserves_explicit_child()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let dir = tempdir()?;
         let child = dir.path().join("child");
         fs::create_dir(&child)?;
@@ -941,8 +1030,8 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_recursive_child_rewrites_descendant_event_paths(
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn overlapping_recursive_child_rewrites_descendant_event_paths()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let cwd = std::env::current_dir()?;
         let dir = tempfile::Builder::new()
             .prefix("notify-overlap-")

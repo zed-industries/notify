@@ -47,15 +47,17 @@
 //!
 //! # Features
 //!
-//! The following crate features can be turned on or off in your cargo dependency config:
+//! The following crate features can be configured in your Cargo dependency:
 //!
-//! - `serde` passed down to notify-types, off by default
-//! - `web-time` passed down to notify-types, off by default
-//! - `crossbeam-channel` passed down to notify, off by default
-//! - `flume` passed down to notify, off by default
-//! - `macos_fsevent` passed down to notify, off by default
-//! - `macos_kqueue` passed down to notify, off by default
-//! - `serialization-compat-6` passed down to notify, off by default
+//! - `macos_fsevent` (default) enables notify's FSEvents backend on macOS
+//! - `freebsd_inotify` enables notify's inotify backend on FreeBSD 14.5+
+//!   - inotify is automatically enabled when built natively, this feature is only needed for cross-compilation
+//! - `macos_kqueue` enables notify's kqueue backend on macOS
+//! - `serde` enables serialization support in notify-types
+//! - `web-time` uses `web_time::Instant` for debounced events
+//! - `crossbeam-channel`, `flume`, `futures`, and `tokio` enable the corresponding
+//!   channel senders as event handlers
+//! - `serialization-compat-6` restores notify 6 serialization behavior
 //!
 //! # Caveats
 //!
@@ -75,8 +77,8 @@ use std::{
     collections::{BinaryHeap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -95,9 +97,9 @@ pub use notify_types::debouncer_full::DebouncedEvent;
 
 use file_id::FileId;
 use notify::{
-    event::{ModifyKind, RemoveKind, RenameMode},
     Error, ErrorKind, Event, EventKind, PathOp, RecommendedWatcher, RecursiveMode,
     UpdatePathsError, Watcher, WatcherKind,
+    event::{ModifyKind, RemoveKind, RenameMode},
 };
 
 /// The set of requirements for watcher debounce event handling functions.
@@ -768,32 +770,34 @@ pub fn new_debouncer_opt<F: DebounceEventHandler, T: Watcher, C: FileIdCache + S
     let stop_c = stop.clone();
     let thread = std::thread::Builder::new()
         .name("notify-rs debouncer loop".to_string())
-        .spawn(move || loop {
-            let mut lock = data_c.inner.lock().unwrap();
-            while lock.queues.is_empty()
-                && lock.errors.is_empty()
-                && lock.rescan_event.is_none()
-                && !stop_c.load(Ordering::Acquire)
-            {
-                lock = data_c.changed.wait(lock).unwrap();
-            }
-            if stop_c.load(Ordering::Acquire) {
-                break;
-            }
-            drop(lock);
-            std::thread::sleep(tick);
-            if stop_c.load(Ordering::Acquire) {
-                break;
-            }
-            lock = data_c.inner.lock().unwrap();
-            let send_data = lock.debounced_events();
-            let errors = lock.errors();
-            drop(lock);
-            if !send_data.is_empty() {
-                event_handler.handle_event(Ok(send_data));
-            }
-            if !errors.is_empty() {
-                event_handler.handle_event(Err(errors));
+        .spawn(move || {
+            loop {
+                let mut lock = data_c.inner.lock().unwrap();
+                while lock.queues.is_empty()
+                    && lock.errors.is_empty()
+                    && lock.rescan_event.is_none()
+                    && !stop_c.load(Ordering::Acquire)
+                {
+                    lock = data_c.changed.wait(lock).unwrap();
+                }
+                if stop_c.load(Ordering::Acquire) {
+                    break;
+                }
+                drop(lock);
+                std::thread::sleep(tick);
+                if stop_c.load(Ordering::Acquire) {
+                    break;
+                }
+                lock = data_c.inner.lock().unwrap();
+                let send_data = lock.debounced_events();
+                let errors = lock.errors();
+                drop(lock);
+                if !send_data.is_empty() {
+                    event_handler.handle_event(Ok(send_data));
+                }
+                if !errors.is_empty() {
+                    event_handler.handle_event(Err(errors));
+                }
             }
         })?;
 

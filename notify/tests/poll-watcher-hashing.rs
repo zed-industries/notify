@@ -1,8 +1,10 @@
-#![cfg(not(target_os = "windows"))]
+// The mtime-vs-content event-kind distinction this test asserts is validated against Linux
+// filesystem semantics. On macOS (APFS) a same-content rewrite with a fresh mtime is reported as
+// `Modify(Data)` rather than `Modify(Metadata(WriteTime))`, so the test is Linux-only.
+#![cfg(target_os = "linux")]
 use nix::sys::stat::futimens;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, SystemTime};
@@ -12,8 +14,7 @@ use nix::sys::time::TimeSpec;
 use tempfile::TempDir;
 
 use notify::event::{CreateKind, DataChange, MetadataKind, ModifyKind};
-use notify::poll::PollWatcherConfig;
-use notify::{Event, EventKind, PollWatcher, RecursiveMode, Watcher};
+use notify::{Config, Event, EventKind, PollWatcher, RecursiveMode, Watcher};
 
 #[test]
 fn test_poll_watcher_distinguish_modify_kind() {
@@ -55,12 +56,14 @@ impl TestHarness {
     pub fn setup() -> Self {
         let tempdir = tempfile::tempdir().unwrap();
 
-        let config = PollWatcherConfig {
-            compare_contents: true,
-            poll_interval: Duration::from_millis(10),
-        };
+        // Manual polling: `write_file_keep_time` restores the write time in a second syscall
+        // after the write, and a background scan landing in between would see the new content
+        // with a new write time and report `Metadata(WriteTime)` instead of `Data`.
+        let config = Config::default()
+            .with_compare_contents(true)
+            .with_manual_polling();
         let (tx, rx) = sync::mpsc::channel();
-        let watcher = PollWatcher::with_config(
+        let watcher = PollWatcher::new(
             move |event: notify::Result<Event>| {
                 tx.send(event).unwrap();
             },
@@ -96,7 +99,7 @@ impl TestHarness {
         let file = self.write_file_common(path.as_ref(), contents);
         let atime = Self::to_timespec(metadata.accessed().unwrap());
         let mtime = Self::to_timespec(metadata.modified().unwrap());
-        futimens(file.as_raw_fd(), &atime, &mtime).unwrap();
+        futimens(&file, &atime, &mtime).unwrap();
     }
 
     fn write_file_common(&self, path: &Path, contents: &str) -> File {
@@ -116,11 +119,23 @@ impl TestHarness {
     }
 
     fn expect_recv<P: AsRef<Path>>(&self, expected_path: P, expected_kind: EventKind) {
-        let actual = self
-            .rx
-            .recv_timeout(Duration::from_secs(15))
-            .unwrap()
-            .expect("Watch I/O error not expected under test");
+        self.watcher.poll_blocking().expect("poll");
+
+        let watched_dir = vec![self.testdir.path().to_path_buf()];
+        let actual = loop {
+            let event = self
+                .rx
+                .recv_timeout(Duration::from_secs(15))
+                .unwrap()
+                .expect("Watch I/O error not expected under test");
+            // Creating an entry bumps the containing directory's own write time, and the scan
+            // reports a directory before the entries inside it. That event is not what this
+            // test is about.
+            if event.paths != watched_dir {
+                break event;
+            }
+        };
+
         assert_eq!(actual.paths, vec![expected_path.as_ref().to_path_buf()]);
         assert_eq!(expected_kind, actual.kind);
     }
