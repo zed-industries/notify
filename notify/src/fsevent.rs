@@ -589,9 +589,15 @@ impl FsEventWatcher {
 
         // Over roughly RLIMIT_NOFILE/10 paths across all live streams, FSEvents
         // closes fd 0, which this process owns. The corruption then surfaces as
-        // EBADF on unrelated files.
+        // EBADF on unrelated files. It only happens with `WatchRoot`, which is
+        // what makes a stream hold a descriptor per ancestor of every path;
+        // without the flag a stream holds no descriptors per path at all.
         let path_count = stream_paths.iter().count();
-        let budget = fsevents_path_budget().unwrap_or(usize::MAX);
+        let budget = if self.flags & fs::kFSEventStreamCreateFlagWatchRoot != 0 {
+            fsevents_path_budget().unwrap_or(usize::MAX)
+        } else {
+            usize::MAX
+        };
         let path_reservation =
             match FseventsPathReservation::acquire(&ACTIVE_FSEVENTS_PATHS, path_count, budget) {
                 Ok(reservation) => reservation,
@@ -1983,6 +1989,7 @@ mod tests {
 
         let tmpdir = testdir();
         let (mut watcher, _rx) = watcher();
+        watcher.watcher.flags |= fs::kFSEventStreamCreateFlagWatchRoot;
 
         let mut paths = Vec::new();
         for i in 0..=budget {
