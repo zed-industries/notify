@@ -1839,7 +1839,15 @@ mod tests {
             ));
         }
 
-        assert!(watcher.watcher.update_paths(paths).is_err());
+        let error = watcher
+            .watcher
+            .update_paths(paths)
+            .expect_err("watching 4097 paths should fail to start the stream");
+        assert!(
+            matches!(error.source.kind, ErrorKind::FsEventStreamStart),
+            "expected FsEventStreamStart, got {:?}",
+            error.source.kind
+        );
 
         // Best-effort cleanup: on macOS + recent rustc, `remove_dir_all` can
         // panic with `closedir: Bad file descriptor` while tearing down the
