@@ -126,6 +126,7 @@ impl schema::Error {
             "path-not-found" => ErrorKind::PathNotFound,
             "watch-not-found" => ErrorKind::WatchNotFound,
             "max-files-watch" => ErrorKind::MaxFilesWatch,
+            "fs-event-stream-start" => ErrorKind::FsEventStreamStart,
             _ => panic!("unknown error type `{}`", self.kind),
         };
         let mut error = Error::new(kind);

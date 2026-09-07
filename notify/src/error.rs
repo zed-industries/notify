@@ -33,6 +33,9 @@ pub enum ErrorKind {
 
     /// Can't watch (more) files, limit on the total number of inotify watches reached
     MaxFilesWatch,
+
+    /// The FSEvents stream failed to start.
+    FsEventStreamStart,
 }
 
 /// Notify error type.
@@ -125,6 +128,7 @@ impl fmt::Display for Error {
             ErrorKind::Generic(ref err) => err.clone(),
             ErrorKind::Io(ref err) => err.to_string(),
             ErrorKind::MaxFilesWatch => "OS file watch limit reached.".into(),
+            ErrorKind::FsEventStreamStart => "Unable to start FSEvents stream.".into(),
         };
 
         if self.paths.is_empty() {

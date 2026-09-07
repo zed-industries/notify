@@ -696,7 +696,7 @@ impl FsEventWatcher {
                         fs::FSEventStreamInvalidate(stream);
                         fs::FSEventStreamRelease(stream);
                         rl_tx
-                            .send(Err(Error::generic("unable to start FSEvent stream")))
+                            .send(Err(Error::new(ErrorKind::FsEventStreamStart)))
                             .expect("Unable to send error for FSEventStreamStart");
                         return;
                     }
