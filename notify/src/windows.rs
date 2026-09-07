@@ -288,13 +288,12 @@ impl ReadDirectoryChangesServer {
         is_recursive: bool,
         separator_style: SeparatorStyle,
     ) -> Result<PathBuf> {
-        let metadata = path.absolute.metadata();
+        let metadata = path
+            .absolute
+            .metadata()
+            .map_err(|error| Error::io_watch(error).add_path(path.requested.clone()))?;
         // path must exist and be either a file or directory
-        if metadata
-            .as_ref()
-            .map(|m| !m.is_dir() && !m.is_file())
-            .unwrap_or(true)
-        {
+        if !metadata.is_dir() && !metadata.is_file() {
             return Err(
                 Error::generic("Input watch path is neither a file nor a directory.")
                     .add_path(path.requested),
@@ -302,7 +301,7 @@ impl ReadDirectoryChangesServer {
         }
 
         let (watching_file, dir_target) = {
-            if metadata.map(|m| m.is_dir()).unwrap_or(false) {
+            if metadata.is_dir() {
                 (false, path.absolute.clone())
             } else {
                 // emulate file watching by watching the parent directory
@@ -911,7 +910,7 @@ pub mod tests {
         SeparatorStyle, completion_rescan_event, normalize_path_separators, trim_leading_separators,
     };
     use crate::{
-        Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
+        ErrorKind, Event, EventKind, ReadDirectoryChangesWatcher, RecursiveMode, Watcher,
         WindowsPathSeparatorStyle, test::*,
     };
 
@@ -943,6 +942,25 @@ pub mod tests {
     fn watcher_is_send_and_sync() {
         fn check<T: Send + Sync>() {}
         check::<ReadDirectoryChangesWatcher>();
+    }
+
+    #[test]
+    fn watching_missing_path_returns_path_not_found() {
+        let temporary_directory = tempdir().expect("create temporary directory");
+        let path = temporary_directory.path().join("missing");
+        let mut watcher = ReadDirectoryChangesWatcher::new(|_| {}, crate::Config::default())
+            .expect("create watcher");
+
+        let error = watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .expect_err("watching a missing path must fail");
+        assert!(matches!(error.kind, ErrorKind::PathNotFound));
+        assert_eq!(error.paths, vec![path.clone()]);
+
+        let error = watcher
+            .unwatch(&path)
+            .expect_err("missing path must not have been inserted");
+        assert!(matches!(error.kind, ErrorKind::WatchNotFound));
     }
 
     #[test]

@@ -72,7 +72,7 @@ impl ScanEventHandler for () {
 use data::{DataBuilder, WatchData};
 mod data {
     use crate::{
-        EventHandler, RecursiveMode,
+        Error, EventHandler, RecursiveMode,
         event::{CreateKind, DataChange, Event, EventKind, MetadataKind, ModifyKind, RemoveKind},
         paths::{WatchPath, reported_path},
     };
@@ -152,7 +152,7 @@ mod data {
             root: WatchPath,
             is_recursive: bool,
             follow_symlinks: bool,
-        ) -> Option<WatchData> {
+        ) -> crate::Result<WatchData> {
             WatchData::new(self, root, is_recursive, follow_symlinks)
         }
 
@@ -194,29 +194,9 @@ mod data {
             root: WatchPath,
             is_recursive: bool,
             follow_symlinks: bool,
-        ) -> Option<Self> {
-            // If metadata read error at `root` path, it will emit
-            // a error event and stop to create the whole `WatchData`.
-            //
-            // QUESTION: inconsistent?
-            //
-            // When user try to *CREATE* a watch by `poll_watcher.watch(root, ..)`,
-            // if `root` path hit an io error, then watcher will reject to
-            // create this new watch.
-            //
-            // This may inconsistent with *POLLING* a watch. When watcher
-            // continue polling, io error at root path will not delete
-            // a existing watch. polling still working.
-            //
-            // So, consider a config file may not exists at first time but may
-            // create after a while, developer cannot watch it.
-            //
-            // FIXME: Can we always allow to watch a path, even file not
-            // found at this path?
-            if let Err(e) = fs::metadata(&root.absolute) {
-                data_builder.emitter.emit_io_err(e, Some(&root.requested));
-                return None;
-            }
+        ) -> crate::Result<Self> {
+            fs::metadata(&root.absolute)
+                .map_err(|error| Error::io_watch(error).add_path(root.requested.clone()))?;
 
             let all_path_data = Self::scan_all_path_data(
                 data_builder,
@@ -228,7 +208,7 @@ mod data {
             )
             .collect();
 
-            Some(Self {
+            Ok(Self {
                 root: root.absolute,
                 requested_root: root.requested,
                 is_recursive,
@@ -696,8 +676,6 @@ impl PollWatcher {
 
     /// Watch a path location.
     ///
-    /// QUESTION: this function never return an Error, is it as intend?
-    /// Please also consider the IO Error event problem.
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> crate::Result<()> {
         let watch_path = WatchPath::new(path)?;
 
@@ -713,12 +691,8 @@ impl PollWatcher {
             watch_path.clone(),
             recursive_mode.is_recursive(),
             self.follow_sylinks,
-        );
-
-        // if create watch_data successful, add it to watching list.
-        if let Some(watch_data) = watch_data {
-            watches.insert(watch_path.absolute, watch_data);
-        }
+        )?;
+        watches.insert(watch_path.absolute, watch_data);
 
         Ok(())
     }
@@ -775,7 +749,7 @@ impl Drop for PollWatcher {
 #[cfg(test)]
 mod tests {
     use super::PollWatcher;
-    use crate::{Config, RecursiveMode, Watcher, test::*};
+    use crate::{Config, ErrorKind, RecursiveMode, Watcher, test::*};
 
     fn watcher() -> (TestWatcher<PollWatcher>, Receiver) {
         poll_watcher_channel()
@@ -799,6 +773,24 @@ mod tests {
     fn poll_watcher_is_send_and_sync() {
         fn check<T: Send + Sync>() {}
         check::<PollWatcher>();
+    }
+
+    #[test]
+    fn watching_missing_path_returns_path_not_found() {
+        let temporary_directory = testdir();
+        let path = temporary_directory.path().join("missing");
+        let mut watcher = PollWatcher::new(|_| {}, Config::default()).expect("create watcher");
+
+        let error = watcher
+            .watch(&path, RecursiveMode::NonRecursive)
+            .expect_err("watching a missing path must fail");
+        assert!(matches!(error.kind, ErrorKind::PathNotFound));
+        assert_eq!(error.paths, vec![path.clone()]);
+
+        let error = watcher
+            .unwatch(&path)
+            .expect_err("missing path must not have been inserted");
+        assert!(matches!(error.kind, ErrorKind::WatchNotFound));
     }
 
     #[test]
