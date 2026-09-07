@@ -408,45 +408,52 @@ impl FsEventWatcher {
     }
 
     fn watch_inner(&mut self, path: &Path, recursive_mode: RecursiveMode) -> Result<()> {
-        let result = self.append_path(path, recursive_mode);
-        self.restart()?;
-        result
+        self.append_path(path, recursive_mode)?;
+        self.restart()
     }
 
     fn unwatch_inner(&mut self, path: &Path) -> Result<()> {
-        let result = self.remove_path(path);
-        self.restart()?;
-        result
+        self.remove_path(path)?;
+        self.restart()
     }
 
     fn update_paths_inner(
         &mut self,
         ops: Vec<crate::PathOp>,
     ) -> crate::StdResult<(), crate::UpdatePathsError> {
+        let mut applied_operation_count = 0;
         let result = crate::update_paths(ops, |op| match op {
-            crate::PathOp::Watch(path, config) => self
-                .append_path(&path, config.recursive_mode())
-                .map_err(|e| (PathOp::Watch(path, config), e)),
-            crate::PathOp::Unwatch(path) => self
-                .remove_path(&path)
-                .map_err(|e| (PathOp::Unwatch(path), e)),
+            crate::PathOp::Watch(path, config) => {
+                self.append_path(&path, config.recursive_mode())
+                    .map_err(|error| (PathOp::Watch(path, config), error))?;
+                applied_operation_count += 1;
+                Ok(())
+            }
+            crate::PathOp::Unwatch(path) => {
+                self.remove_path(&path)
+                    .map_err(|error| (PathOp::Unwatch(path), error))?;
+                applied_operation_count += 1;
+                Ok(())
+            }
         });
 
+        if applied_operation_count == 0 {
+            return result;
+        }
+
         match self.restart() {
-            Err(run_error) => match result {
-                Ok(()) => Err(crate::UpdatePathsError {
+            Ok(()) => result,
+            Err(run_error) => {
+                let remaining = match result {
+                    Ok(()) => Vec::new(),
+                    Err(error) => error.origin.into_iter().chain(error.remaining).collect(),
+                };
+                Err(crate::UpdatePathsError {
                     source: run_error,
                     origin: None,
-                    remaining: Default::default(),
-                }),
-                Err(path_op_error) => {
-                    log::error!(
-                        "Unable to run fsevents watcher after updating paths error: {run_error:?}"
-                    );
-                    Err(path_op_error)
-                }
-            },
-            Ok(()) => result,
+                    remaining,
+                })
+            }
         }
     }
 
@@ -1014,6 +1021,75 @@ mod tests {
 
     fn watcher() -> (TestWatcher<FsEventWatcher>, Receiver) {
         channel()
+    }
+
+    #[test]
+    fn missing_watch_path_does_not_restart_the_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing_path = dir.path().join("missing");
+        let mut watcher = FsEventWatcher::new(|_| {}, Config::default()).unwrap();
+        watcher
+            .watch_inner(dir.path(), RecursiveMode::Recursive)
+            .expect("watch existing path");
+
+        let runloop = watcher
+            .runloop
+            .as_ref()
+            .expect("watcher to be running")
+            .runloop
+            .clone();
+        let error = watcher
+            .watch_inner(&missing_path, RecursiveMode::Recursive)
+            .expect_err("missing path should fail");
+
+        assert!(matches!(error.kind, ErrorKind::PathNotFound));
+        assert_eq!(watcher.watches.len(), 1);
+        assert!(watcher.is_running());
+        assert_eq!(
+            cf::CFRetained::as_ptr(
+                &watcher
+                    .runloop
+                    .as_ref()
+                    .expect("watcher to remain running")
+                    .runloop
+            ),
+            cf::CFRetained::as_ptr(&runloop)
+        );
+    }
+
+    #[test]
+    fn update_paths_restarts_after_operations_before_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let missing = dir.path().join("missing");
+        let remaining = dir.path().join("remaining");
+        std::fs::create_dir(&first).unwrap();
+        std::fs::create_dir(&remaining).unwrap();
+        let mut watcher = FsEventWatcher::new(|_| {}, Config::default()).unwrap();
+
+        let error = watcher
+            .update_paths_inner(vec![
+                PathOp::watch_recursive(first.clone()),
+                PathOp::watch_recursive(missing.clone()),
+                PathOp::watch_recursive(remaining.clone()),
+            ])
+            .expect_err("missing path should fail");
+
+        assert!(matches!(error.source.kind, ErrorKind::PathNotFound));
+        assert!(matches!(
+            error.origin,
+            Some(PathOp::Watch(path, _)) if path == missing
+        ));
+        assert_eq!(error.remaining.len(), 1);
+        assert!(matches!(
+            &error.remaining[0],
+            PathOp::Watch(path, _) if path == &remaining
+        ));
+        assert_eq!(
+            watcher.watched_paths().expect("watched paths"),
+            vec![(first, RecursiveMode::Recursive)]
+        );
+        assert!(watcher.is_running());
     }
 
     #[test]
