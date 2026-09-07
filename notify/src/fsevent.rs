@@ -17,7 +17,8 @@
 use crate::paths::{absolute_path, reported_path};
 use crate::{event::*, PathOp};
 use crate::{
-    unbounded, Config, Error, EventHandler, EventKindMask, RecursiveMode, Result, Sender, Watcher,
+    unbounded, Config, Error, ErrorKind, EventHandler, EventKindMask, RecursiveMode, Result,
+    Sender, Watcher,
 };
 use objc2_core_foundation as cf;
 use objc2_core_services as fs;
@@ -627,7 +628,7 @@ impl FsEventWatcher {
                         fs::FSEventStreamInvalidate(stream);
                         fs::FSEventStreamRelease(stream);
                         rl_tx
-                            .send(Err(Error::generic("unable to start FSEvent stream")))
+                            .send(Err(Error::new(ErrorKind::FsEventStreamStart)))
                             .expect("Unable to send error for FSEventStreamStart");
                         return;
                     }
@@ -1838,7 +1839,15 @@ mod tests {
             ));
         }
 
-        assert!(watcher.watcher.update_paths(paths).is_err());
+        let error = watcher
+            .watcher
+            .update_paths(paths)
+            .expect_err("watching 4097 paths should fail to start the stream");
+        assert!(
+            matches!(error.source.kind, ErrorKind::FsEventStreamStart),
+            "expected FsEventStreamStart, got {:?}",
+            error.source.kind
+        );
 
         // Best-effort cleanup: on macOS + recent rustc, `remove_dir_all` can
         // panic with `closedir: Bad file descriptor` while tearing down the
