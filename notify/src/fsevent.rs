@@ -352,9 +352,7 @@ impl FsEventWatcher {
             paths: cf::CFMutableArray::empty(),
             since_when: fs::kFSEventStreamEventIdSinceNow,
             latency,
-            flags: fs::kFSEventStreamCreateFlagFileEvents
-                | fs::kFSEventStreamCreateFlagNoDefer
-                | fs::kFSEventStreamCreateFlagWatchRoot,
+            flags: fs::kFSEventStreamCreateFlagFileEvents | fs::kFSEventStreamCreateFlagNoDefer,
             event_handler,
             runloop: None,
             recursive_info: HashMap::new(),
