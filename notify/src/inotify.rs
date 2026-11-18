@@ -696,14 +696,6 @@ impl EventLoop {
     }
 
     fn remove_watch(&mut self, path: PathBuf, remove_recursive: bool) -> Result<()> {
-        let preserved_roots = preserved_watch_roots(
-            &path,
-            remove_recursive,
-            self.watches
-                .iter()
-                .map(|(path, watch)| (path, &watch.metadata)),
-        );
-
         match self.watches.remove(&path) {
             None => return Err(Error::watch_not_found().add_path(path)),
             Some(watch) => {
@@ -718,6 +710,13 @@ impl EventLoop {
                     self.paths.remove(&watch.watch_descriptor);
 
                     if watch.metadata.is_recursive || remove_recursive {
+                        let preserved_roots = preserved_watch_roots(
+                            &path,
+                            remove_recursive,
+                            self.watches
+                                .iter()
+                                .map(|(path, watch)| (path, &watch.metadata)),
+                        );
                         let mut remove_list = Vec::new();
                         let mut reset_list = Vec::new();
                         for (w, p) in &self.paths {
@@ -758,20 +757,19 @@ impl EventLoop {
         path: PathBuf,
         remove_recursive: bool,
     ) -> Result<()> {
-        let preserved_roots = preserved_watch_roots(
-            &path,
-            remove_recursive,
-            self.watches
-                .iter()
-                .map(|(path, watch)| (path, &watch.metadata)),
-        );
-
         match self.watches.remove(&path) {
             None => return Err(Error::watch_not_found().add_path(path)),
             Some(watch) => {
                 self.paths.remove(&watch.watch_descriptor);
 
                 if watch.metadata.is_recursive || remove_recursive {
+                    let preserved_roots = preserved_watch_roots(
+                        &path,
+                        remove_recursive,
+                        self.watches
+                            .iter()
+                            .map(|(path, watch)| (path, &watch.metadata)),
+                    );
                     let mut remove_list = Vec::new();
                     let mut reset_list = Vec::new();
                     for (w, p) in &self.paths {
